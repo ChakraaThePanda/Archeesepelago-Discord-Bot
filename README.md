@@ -1,4 +1,4 @@
-# Archipelago Discord Bot
+# Archeesepelago-Discord-Bot
 
 Posts Archipelago multiworld room status from [CheeseTrackers](https://cheesetrackers.theincrediblewheelofchee.se) into Discord.
 
