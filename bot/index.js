@@ -149,7 +149,7 @@ async function buildStatusEmbeds(trackerId, guild) {
     const blockLines = [`- **${label}**`];
     for (const g of ownerGames) {
       const comp = COMPLETION_EMOJI[g.completion_status] ?? "";
-      const prog = PROGRESSION_EMOJI[g.progression_status] ?? "❓";
+      const prog = (g.completion_status === "done" || g.completion_status === "released") ? "" : (PROGRESSION_EMOJI[g.progression_status] ?? "❓");
       const pct  = g.checks_total ? Math.round((g.checks_done / g.checks_total) * 100) : 0;
       blockLines.push(
         `  - ${prog}${comp} \`${g.name}\` — **${g.game}** — ${g.checks_done}/${g.checks_total} (${pct}%)`
