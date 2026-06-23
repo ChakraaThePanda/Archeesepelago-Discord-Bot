@@ -26,7 +26,7 @@ const BASE_URL      = "https://cheesetrackers.theincrediblewheelofchee.se/api";
 const LINKS_FILE    = path.join(__dirname, "links.json");
 
 // ─── Persistent Links (JSON) ──────────────────────────────────────────────────
-// Structure: { "<guildId>:<channelId>": { trackerId } }
+// Structure: { "<guildId>:<channelId>": { trackerId, messageId?, lastActivityAt? } }
 
 function loadLinks() {
   if (!fs.existsSync(LINKS_FILE)) return {};
@@ -123,7 +123,17 @@ function stopAutoRefresh(channelId) {
   activeRefreshes.delete(channelId);
 }
 
-function startAutoRefresh(message, trackerId, guild, initialHash) {
+function clearMessageFromLinks(guildId, channelId) {
+  const links = loadLinks();
+  const key   = linkKey(guildId, channelId);
+  if (links[key]) {
+    delete links[key].messageId;
+    delete links[key].lastActivityAt;
+    saveLinks(links);
+  }
+}
+
+function startAutoRefresh(message, trackerId, guild, initialHash, initialLastActivityAt = Date.now()) {
   const channelId = message.channelId;
   stopAutoRefresh(channelId);
 
@@ -131,9 +141,9 @@ function startAutoRefresh(message, trackerId, guild, initialHash) {
     message,
     trackerId,
     guild,
-    lastHash:        initialHash,
-    lastActivityAt:  Date.now(),
-    intervalId:      null,
+    lastHash:       initialHash,
+    lastActivityAt: initialLastActivityAt,
+    intervalId:     null,
   };
 
   session.intervalId = setInterval(async () => {
@@ -146,12 +156,16 @@ function startAutoRefresh(message, trackerId, guild, initialHash) {
       if (changed) {
         session.lastHash       = newHash;
         session.lastActivityAt = now;
+        const links = loadLinks();
+        const key   = linkKey(guild.id, channelId);
+        if (links[key]) { links[key].lastActivityAt = now; saveLinks(links); }
       }
 
       if (now - session.lastActivityAt > INACTIVITY_TIMEOUT_MS) {
         stopAutoRefresh(channelId);
         const embeds = await buildStatusEmbeds(trackerId, data, guild, "stopped");
         await session.message.edit({ embeds });
+        clearMessageFromLinks(guild.id, channelId);
         return;
       }
 
@@ -162,7 +176,10 @@ function startAutoRefresh(message, trackerId, guild, initialHash) {
     } catch (err) {
       console.error("[auto-refresh]", err);
       // Unknown Message or Unknown Channel — message/channel is gone
-      if (err.code === 10008 || err.code === 10003) stopAutoRefresh(channelId);
+      if (err.code === 10008 || err.code === 10003) {
+        clearMessageFromLinks(guild.id, channelId);
+        stopAutoRefresh(channelId);
+      }
     }
   }, REFRESH_INTERVAL_MS);
 
@@ -254,8 +271,9 @@ async function buildStatusEmbeds(trackerId, data, guild, refreshStatus = null) {
   const nowStr      = new Date().toString().replace(/GMT[+-]\d{4} \((.+?)\)/, (_, tz) =>
     tz.includes(' ') ? tz.split(' ').map(w => w[0]).join('') : tz
   );
-  const refreshLine = refreshStatus === "active"  ? `⟳ Updates every 5 min — Last Updated: ${nowStr}`
-                    : refreshStatus === "stopped" ? `⏹ Stopped refreshing (1h inactivity) — Last Updated: ${nowStr}`
+  const refreshLine = refreshStatus === "active"      ? `⟳ Updates every 5 min — Last Updated: ${nowStr}`
+                    : refreshStatus === "stopped"     ? `⏹️ Stopped refreshing (1h inactivity) — Last Updated: ${nowStr}`
+                    : refreshStatus === "superseded"  ? `⊘ Superseded by a newer post`
                     : null;
 
   return chunks.map((desc, i) => {
@@ -383,8 +401,27 @@ async function handlePostButton(interaction) {
     return interaction.followUp({ content: `❌ ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
+  // Stop any running refresh and supersede any existing live message for this channel
+  stopAutoRefresh(interaction.channelId);
+  const links = loadLinks();
+  const key   = linkKey(interaction.guildId, interaction.channelId);
+  if (links[key]?.messageId) {
+    try {
+      const old = await interaction.channel.messages.fetch(links[key].messageId);
+      const supersededEmbeds = await buildStatusEmbeds(trackerId, data, interaction.guild, "superseded");
+      await old.edit({ embeds: supersededEmbeds });
+    } catch { /* old message gone — ignore */ }
+  }
+
   const message = await interaction.channel.send({ embeds });
-  startAutoRefresh(message, trackerId, interaction.guild, hashTrackerData(data));
+  const now     = Date.now();
+  startAutoRefresh(message, trackerId, interaction.guild, hashTrackerData(data), now);
+
+  if (links[key]) {
+    links[key].messageId      = message.id;
+    links[key].lastActivityAt = now;
+    saveLinks(links);
+  }
 
   await interaction.editReply({ content: "✅ Posted!", embeds: [], components: [] });
 }
@@ -425,6 +462,40 @@ client.once("clientReady", async () => {
   });
   console.log("✅ Commands registered globally.");
   client.user.setActivity("/help to get started", { type: ActivityType.Listening });
+
+  // Resume auto-refresh for any persisted message IDs
+  const links  = loadLinks();
+  let modified = false;
+  for (const [key, link] of Object.entries(links)) {
+    if (!link.messageId) continue;
+
+    const now                  = Date.now();
+    const [guildId, channelId] = key.split(":");
+    const stale                = now - (link.lastActivityAt ?? 0) > INACTIVITY_TIMEOUT_MS;
+
+    try {
+      const guild   = await client.guilds.fetch(guildId);
+      const channel = await client.channels.fetch(channelId);
+      const message = await channel.messages.fetch(link.messageId);
+      const data    = await ctGet(`/tracker/${link.trackerId}`);
+
+      if (stale) {
+        const embeds = await buildStatusEmbeds(link.trackerId, data, guild, "stopped");
+        await message.edit({ embeds });
+      } else {
+        startAutoRefresh(message, link.trackerId, guild, hashTrackerData(data), link.lastActivityAt);
+        console.log(`[resume] Restored auto-refresh for ${key}`);
+        continue;
+      }
+    } catch (err) {
+      console.warn(`[resume] Failed to restore ${key}:`, err.message);
+    }
+
+    delete link.messageId;
+    delete link.lastActivityAt;
+    modified = true;
+  }
+  if (modified) saveLinks(links);
 });
 
 client.on("interactionCreate", async interaction => {
