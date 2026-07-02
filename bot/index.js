@@ -819,6 +819,10 @@ const client = new Client({
   ],
 });
 
+function setPresence() {
+  client.user?.setActivity("/help to get started", { type: ActivityType.Listening });
+}
+
 client.once("clientReady", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   const rest = new REST().setToken(DISCORD_TOKEN);
@@ -827,7 +831,8 @@ client.once("clientReady", async () => {
     body: commands.map(c => c.toJSON()),
   });
   console.log("✅ Commands registered globally.");
-  client.user.setActivity("/help to get started", { type: ActivityType.Listening });
+  setPresence();
+  setInterval(setPresence, 30 * 60 * 1000);
 
   // Resume auto-refresh for any persisted message IDs, immediately updating each embed
   const links  = loadLinks();
@@ -903,9 +908,8 @@ client.once("clientReady", async () => {
   if (modified) saveLinks(links);
 });
 
-client.on("shardResume", () => {
-  client.user?.setActivity("/help to get started", { type: ActivityType.Listening });
-});
+client.on("shardReady", () => { setPresence(); });
+client.on("shardResume", () => { setPresence(); });
 
 client.on("interactionCreate", async interaction => {
   try {
