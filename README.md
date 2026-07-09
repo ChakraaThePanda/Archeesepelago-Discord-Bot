@@ -30,9 +30,16 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 | Command | Who can use | Description |
 |---|---|---|
-| `/link <url>` | Manage Channels | Links the current channel to a CheeseTrackers room. Accepts a full URL or bare tracker ID. Re-running it in an already-linked channel updates the link. |
-| `/status` | Everyone | Shows a status preview (visible only to you), with a **Post to channel** button to publish it. |
+| `/link <url> <mode>` | Manage Channels | Links the current channel to a CheeseTrackers room. Accepts a full URL or bare tracker ID. Mode is **Show All** or **Registered Only** (see below). Re-running it in an already-linked channel updates the link. |
+| `/status` | Everyone | Shows a status preview (visible only to you), with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it. |
+| `/viewmode <mode>` | Manage Channels | Switches an already-linked channel between **Show All** and **Registered Only**, updating any live posted messages immediately. |
+| `/register [user]` | Everyone (self); Manage Channels (others) | Adds you — or, with permission, another member — to the channel's **Registered Only** view. |
+| `/unregister` | Everyone | Removes you from the channel's **Registered Only** view. |
 | `/help` | Everyone | Shows bot info and a link to this GitHub page. |
+
+### View modes
+- **Show All** — every player's games are shown, including unclaimed slots. Best for small rooms.
+- **Registered Only** — only players who've run `/register` are shown. Recommended for big rooms (20+ players) to avoid flooding the channel with huge, frequently-updating posts.
 
 ---
 
@@ -50,8 +57,20 @@ Slots are sorted alphabetically and grouped by owner. Owners appear as Discord `
 | 🏁 Done | 💀 Released | 🚀 Go Mode | 🟡 Soft BK |
 | | | ❓ Unknown | |
 
+Large rooms are split across multiple embeds/messages (paged in the `/status` preview, posted as separate messages once published).
+
+---
+
+## Auto-refresh
+
+Once posted via **Post to channel**, a status post updates itself automatically:
+- Refreshes every 5 minutes if the tracker data changed
+- Stops refreshing after 1 hour with no changes, marking the post as stopped
+- Posting again supersedes the previous live post and starts a fresh refresh cycle
+
 ---
 
 ## Notes
-- Links are saved in `bot/links.json` — one entry per guild+channel pair
+- Links are saved in `bot/links.json` — one entry per guild+channel pair, along with view mode, registered users, and live message IDs
+- Links with no activity for 30+ days are automatically cleaned up on bot startup
 - Slash commands register globally on startup; Discord may take up to an hour to propagate changes to all servers
