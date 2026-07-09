@@ -420,6 +420,15 @@ const commands = [
         .setDescription("CheeseTrackers URL or tracker ID")
         .setRequired(true)
     )
+    .addStringOption(opt =>
+      opt.setName("mode")
+        .setDescription("Which players to display — pick carefully for big rooms")
+        .setRequired(true)
+        .addChoices(
+          { name: "Show All — display every player and unclaimed games", value: "all" },
+          { name: "Registered Only — show only players who used /register", value: "registered" },
+        )
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
 
   new SlashCommandBuilder()
@@ -463,6 +472,7 @@ const commands = [
 async function handleLink(interaction) {
   const channel = interaction.channel;
   const input   = interaction.options.getString("url");
+  const mode    = interaction.options.getString("mode");
 
   let trackerId;
   try {
@@ -472,8 +482,10 @@ async function handleLink(interaction) {
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let data;
   try {
-    await ctGet(`/tracker/${trackerId}`);
+    data = await ctGet(`/tracker/${trackerId}`);
   } catch (err) {
     return interaction.editReply(`❌ Could not reach that tracker: ${err.message}`);
   }
@@ -481,12 +493,20 @@ async function handleLink(interaction) {
   const links    = loadLinks();
   const key      = linkKey(interaction.guildId, channel.id);
   const isUpdate = Boolean(links[key]);
-  links[key]     = { trackerId, linkedAt: Date.now() };
+  links[key]     = { trackerId, linkedAt: Date.now(), mode };
   saveLinks(links);
 
-  const verb = isUpdate ? "updated to" : "linked to";
+  const verb        = isUpdate ? "updated to" : "linked to";
+  const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
+  const modeLabel    = mode === "all" ? "**Show All**" : "**Registered Only**";
+
+  let warning = "";
+  if (mode === "all" && playerCount >= 20) {
+    warning = `\n\n⚠️ **Big world warning:** this room has **${playerCount}** players. **Show All** posts every player's games, which can spread across many embeds/pages and spam the channel on every update. Consider \`/viewmode\` → **Registered Only** so only the players who \`/register\` show up.`;
+  }
+
   await interaction.editReply(
-    `✅ **#${channel.name}** is now ${verb} tracker \`${trackerId}\`.\nRun \`/status\` here to see progress.`
+    `✅ **#${channel.name}** is now ${verb} tracker \`${trackerId}\` in ${modeLabel} mode.\nRun \`/status\` here to see progress.${warning}`
   );
 }
 
@@ -672,7 +692,19 @@ async function handleViewMode(interaction) {
 
   const label = newMode === "all" ? "**Show All**" : "**Registered Only**";
   const hint  = newMode === "registered" ? "\n> Players can use `/register` to add their games to this view." : "";
-  await interaction.editReply(`✅ View mode set to ${label}.${hint}`);
+
+  let warning = "";
+  if (newMode === "all") {
+    try {
+      const data        = await ctGet(`/tracker/${link.trackerId}`);
+      const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
+      if (playerCount >= 20) {
+        warning = `\n\n⚠️ **Big world warning:** this room has **${playerCount}** players. **Show All** posts every player's games, which can spread across many embeds/pages and spam the channel on every update. Consider **Registered Only** so only the players who \`/register\` show up.`;
+      }
+    } catch { /* non-critical — skip warning if tracker fetch fails */ }
+  }
+
+  await interaction.editReply(`✅ View mode set to ${label}.${hint}${warning}`);
 }
 
 async function handleRegister(interaction) {
@@ -798,7 +830,7 @@ async function handleHelp(interaction) {
       "Posts Archipelago multiworld room status from CheeseTrackers into Discord."
     )
     .addFields(
-      { name: "`/link <url>`",    value: "Link this channel to a CheeseTrackers room. Requires **Manage Channels** permission." },
+      { name: "`/link <url> <mode>`", value: "Link this channel to a CheeseTrackers room. Pick a view mode when you link: **Show All** shows every player, **Registered Only** shows just the players who've used `/register`. For big rooms with lots of players, use **Registered Only** so the channel doesn't get flooded. Requires **Manage Channels** permission." },
       { name: "`/status`",        value: "Show a tracker status preview with a **Post to channel** button." },
       { name: "`/viewmode`",      value: "Switch between **Show All** (default) and **Registered Only** view. Requires **Manage Channels** permission." },
       { name: "`/register`",      value: "Add yourself to this channel's registered tracker view. With **Manage Channels** permission, use `/register user:@someone` to register another player." },
