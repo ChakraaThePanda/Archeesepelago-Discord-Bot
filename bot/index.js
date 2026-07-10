@@ -31,9 +31,11 @@ const LINKS_FILE    = path.join(__dirname, "links.json");
 
 // ─── Persistent Links (JSON) ──────────────────────────────────────────────────
 // Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?,
-//   lastActivityAt?, progressionDmUsers?, progressionItemCounts? } }
-// progressionDmUsers: Discord user IDs opted in to Progression DMs for this channel's tracker.
-// progressionItemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only.
+//   lastActivityAt?, progressionDmUsers?, usefulDmUsers?, progressionItemCounts? } }
+// progressionDmUsers / usefulDmUsers: Discord user IDs opted in to Progression / Useful item DMs
+// for this channel's tracker.
+// progressionItemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only
+// (shared baseline for both progression and useful DMs, since it just tracks total items received).
 
 function loadLinks() {
   if (!fs.existsSync(LINKS_FILE)) return {};
@@ -79,12 +81,13 @@ async function ctGet(endpoint) {
   return res.json();
 }
 
-// ─── Archipelago webhost API (progression item DMs) ────────────────────────────
+// ─── Archipelago webhost API (item DMs) ────────────────────────────────────────
 // Public, unauthenticated JSON API exposed by the AP webhost itself (e.g. archipelago.gg),
 // discovered via the CheeseTrackers tracker's `upstream_url` field. Confirmed against
 // ArchipelagoMW/Archipelago's WebHostLib/api/tracker.py and BaseClasses.py.
 
 const PROGRESSION_FLAG = 0b00001; // ItemClassification.progression bit
+const USEFUL_FLAG      = 0b00010; // ItemClassification.useful bit
 
 function deriveApTrackerInfo(upstreamUrl) {
   const url = new URL(upstreamUrl);
@@ -116,19 +119,20 @@ async function getItemIdToNameMap(origin, game, checksum) {
 }
 
 // Diffs each opted-in user's received items against the link's progressionItemCounts and DMs
-// them for any newly-received item flagged as progression. Looks the link up fresh (by `key`)
-// itself, inside withLinks, right before persisting — the network fetches below all happen
-// before that lock is taken, so this never holds up other menu actions for longer than the
-// synchronous diff. Never throws — failures are logged and treated as "no update".
-async function checkNewProgressionItems(data, guild, key) {
+// them for any newly-received item flagged as progression and/or useful (per their own opt-in).
+// Looks the link up fresh (by `key`) itself, inside withLinks, right before persisting — the
+// network fetches below all happen before that lock is taken, so this never holds up other menu
+// actions for longer than the synchronous diff. Never throws — failures are logged and treated
+// as "no update".
+async function checkNewItemDms(data, guild, key) {
   const peek = loadLinks()[key];
-  if (!peek?.progressionDmUsers?.length) return;
+  if (!peek?.progressionDmUsers?.length && !peek?.usefulDmUsers?.length) return;
 
   let apInfo;
   try {
     apInfo = deriveApTrackerInfo(data.upstream_url);
   } catch (err) {
-    console.warn("[progression-dm] Could not derive AP tracker info:", err.message);
+    console.warn("[item-dm] Could not derive AP tracker info:", err.message);
     return;
   }
 
@@ -140,7 +144,7 @@ async function checkNewProgressionItems(data, guild, key) {
       buildMemberByUsernameMap(guild),
     ]);
   } catch (err) {
-    console.warn("[progression-dm] AP webhost fetch failed:", err.message);
+    console.warn("[item-dm] AP webhost fetch failed:", err.message);
     return;
   }
 
@@ -155,7 +159,7 @@ async function checkNewProgressionItems(data, guild, key) {
 
   await withLinks(links => {
     const link = links[key];
-    if (!link?.progressionDmUsers?.length) return;
+    if (!link?.progressionDmUsers?.length && !link?.usefulDmUsers?.length) return;
 
     if (!link.progressionItemCounts) link.progressionItemCounts = {};
     const counts = link.progressionItemCounts;
@@ -178,7 +182,10 @@ async function checkNewProgressionItems(data, guild, key) {
       const game = gameByPosition.get(position);
       if (!game?.effective_discord_username) continue;
       const member = memberByUsername.get(game.effective_discord_username.toLowerCase());
-      if (!member || !link.progressionDmUsers.includes(member.id)) continue;
+      if (!member) continue;
+      const wantsProgression = link.progressionDmUsers?.includes(member.id);
+      const wantsUseful      = link.usefulDmUsers?.includes(member.id);
+      if (!wantsProgression && !wantsUseful) continue;
 
       const checksum = staticData?.datapackage?.[game.game]?.checksum;
       if (!checksum) continue;
@@ -189,14 +196,18 @@ async function checkNewProgressionItems(data, guild, key) {
         // by the same Discord user (even a different one of their games), they found it
         // themselves and already saw it live, so skip the DM.
         const [itemId, , senderPlayer, flags = 0] = netItem;
-        if (!(flags & PROGRESSION_FLAG)) continue;
+
+        let kind;
+        if (wantsProgression && (flags & PROGRESSION_FLAG)) kind = "progression";
+        else if (wantsUseful && (flags & USEFUL_FLAG)) kind = "useful";
+        else continue;
 
         const senderGame = gameByPosition.get(senderPlayer);
         const senderUsername = senderGame?.effective_discord_username?.toLowerCase();
         const senderMember = senderUsername ? memberByUsername.get(senderUsername) : null;
         if (senderMember && senderMember.id === member.id) continue;
 
-        pending.push({ member, game, senderGame, senderPlayer, itemId, checksum, trackerId: link.trackerId, title: data.title });
+        pending.push({ kind, member, game, senderGame, senderPlayer, itemId, checksum, trackerId: link.trackerId, title: data.title });
       }
     }
   });
@@ -208,7 +219,7 @@ async function checkNewProgressionItems(data, guild, key) {
     try {
       idToName = await getItemIdToNameMap(apInfo.origin, p.game.game, p.checksum);
     } catch (err) {
-      console.warn(`[progression-dm] Failed to load datapackage for ${p.game.game}:`, err.message);
+      console.warn(`[item-dm] Failed to load datapackage for ${p.game.game}:`, err.message);
       continue;
     }
 
@@ -217,8 +228,8 @@ async function checkNewProgressionItems(data, guild, key) {
     const trackerUrl  = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${p.trackerId}`;
 
     const embed = new EmbedBuilder()
-      .setColor(0xaf99ef)
-      .setTitle("Progression Item Received")
+      .setColor(p.kind === "useful" ? 0x6d8be8 : 0xaf99ef)
+      .setTitle(p.kind === "useful" ? "Useful Item Received" : "Progression Item Received")
       .setDescription(`**[${p.title}](${trackerUrl})**`)
       .addFields(
         { name: "Item", value: itemName },
@@ -229,7 +240,7 @@ async function checkNewProgressionItems(data, guild, key) {
     try {
       await p.member.send({ embeds: [embed] });
     } catch (err) {
-      console.warn(`[progression-dm] Failed to DM ${p.member.id}:`, err.message);
+      console.warn(`[item-dm] Failed to DM ${p.member.id}:`, err.message);
     }
   }
 }
@@ -366,7 +377,9 @@ function buildMenuEmbed(link, userId, isManager) {
   }
 
   const dmOnProgression = (link.progressionDmUsers ?? []).includes(userId);
+  const dmOnUseful      = (link.usefulDmUsers ?? []).includes(userId);
   lines.push(`Progression item DMs: ${dmOnProgression ? "✅ **On**" : "❌ **Off**"}`);
+  lines.push(`Useful item DMs: ${dmOnUseful ? "✅ **On**" : "❌ **Off**"}`);
 
   e.setDescription(lines.join("\n"));
   return e;
@@ -391,12 +404,9 @@ function buildMainMenuRows(interaction, link) {
   }
 
   if (link) {
-    const dmOnProgression = (link.progressionDmUsers ?? []).includes(interaction.user.id);
     rows.push(
       new ActionRowBuilder().addComponents(
-        dmOnProgression
-          ? new ButtonBuilder().setCustomId("menu:dmprog:off").setLabel("Disable Progression DMs").setStyle(ButtonStyle.Danger)
-          : new ButtonBuilder().setCustomId("menu:dmprog:on").setLabel("Enable Progression DMs").setStyle(ButtonStyle.Success)
+        new ButtonBuilder().setCustomId("menu:dm").setLabel("DM Notifications").setStyle(ButtonStyle.Primary)
       )
     );
   }
@@ -410,6 +420,26 @@ function buildMainMenuRows(interaction, link) {
   }
 
   return rows;
+}
+
+function buildDmMenuRows(link, userId) {
+  const dmOnProgression = (link.progressionDmUsers ?? []).includes(userId);
+  const dmOnUseful      = (link.usefulDmUsers ?? []).includes(userId);
+  return [
+    new ActionRowBuilder().addComponents(
+      dmOnProgression
+        ? new ButtonBuilder().setCustomId("menu:dmprog:off").setLabel("Disable Progression DMs").setStyle(ButtonStyle.Danger)
+        : new ButtonBuilder().setCustomId("menu:dmprog:on").setLabel("Enable Progression DMs").setStyle(ButtonStyle.Success)
+    ),
+    new ActionRowBuilder().addComponents(
+      dmOnUseful
+        ? new ButtonBuilder().setCustomId("menu:dmuseful:off").setLabel("Disable Useful DMs").setStyle(ButtonStyle.Danger)
+        : new ButtonBuilder().setCustomId("menu:dmuseful:on").setLabel("Enable Useful DMs").setStyle(ButtonStyle.Success)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:back").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
+    ),
+  ];
 }
 
 function buildAdminMenuRows(link) {
@@ -521,7 +551,7 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
 
       // Fetches its own data and persists progressionItemCounts internally (via withLinks), so
       // this tick never has to hold a stale in-memory links snapshot across these awaits.
-      await checkNewProgressionItems(data, guild, key);
+      await checkNewItemDms(data, guild, key);
 
       if (now - session.lastActivityAt > INACTIVITY_TIMEOUT_MS) {
         stopAutoRefresh(channelId);
@@ -935,7 +965,7 @@ async function handleSelfDmProgOn(interaction, link) {
 
   await interaction.update({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
-    components: buildMainMenuRows(interaction, freshLink),
+    components: buildDmMenuRows(freshLink, interaction.user.id),
   });
   await interaction.followUp({
     content: "✅ You'll get a DM whenever you receive a progression item in this tracker.",
@@ -965,10 +995,70 @@ async function handleSelfDmProgOff(interaction, link) {
 
   await interaction.update({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
-    components: buildMainMenuRows(interaction, freshLink),
+    components: buildDmMenuRows(freshLink, interaction.user.id),
   });
   await interaction.followUp({
     content: "✅ Turned off Progression item DMs for this tracker.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleSelfDmUsefulOn(interaction, link) {
+  if (!link) {
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  const userId = interaction.user.id;
+  const key    = linkKey(interaction.guildId, interaction.channelId);
+
+  const { alreadyOn, freshLink } = await withLinks(links => {
+    const freshLink = links[key];
+    if (!freshLink.usefulDmUsers) freshLink.usefulDmUsers = [];
+    if (freshLink.usefulDmUsers.includes(userId)) return { alreadyOn: true, freshLink };
+    freshLink.usefulDmUsers.push(userId);
+    return { alreadyOn: false, freshLink };
+  });
+
+  if (alreadyOn) {
+    return interaction.reply({ content: "✅ You're already getting Useful item DMs for this tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.update({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
+    components: buildDmMenuRows(freshLink, interaction.user.id),
+  });
+  await interaction.followUp({
+    content: "✅ You'll get a DM whenever you receive a useful item in this tracker.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleSelfDmUsefulOff(interaction, link) {
+  if (!link) {
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  const userId = interaction.user.id;
+  const key    = linkKey(interaction.guildId, interaction.channelId);
+
+  const { wasOn, freshLink } = await withLinks(links => {
+    const freshLink = links[key];
+    const idx       = (freshLink.usefulDmUsers ?? []).indexOf(userId);
+    if (idx === -1) return { wasOn: false, freshLink };
+    freshLink.usefulDmUsers.splice(idx, 1);
+    return { wasOn: true, freshLink };
+  });
+
+  if (!wasOn) {
+    return interaction.reply({ content: "❌ You're not currently getting Useful item DMs for this tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.update({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
+    components: buildDmMenuRows(freshLink, interaction.user.id),
+  });
+  await interaction.followUp({
+    content: "✅ Turned off Useful item DMs for this tracker.",
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -1171,8 +1261,14 @@ async function handleMenuButton(interaction) {
   if (id === "menu:status")     return handleMenuStatus(interaction, link);
   if (id === "menu:register")   return handleSelfRegister(interaction, link);
   if (id === "menu:unregister") return handleSelfUnregister(interaction, link);
-  if (id === "menu:dmprog:on")  return handleSelfDmProgOn(interaction, link);
-  if (id === "menu:dmprog:off") return handleSelfDmProgOff(interaction, link);
+  if (id === "menu:dm") {
+    if (!link) return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+    return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildDmMenuRows(link, interaction.user.id) });
+  }
+  if (id === "menu:dmprog:on")    return handleSelfDmProgOn(interaction, link);
+  if (id === "menu:dmprog:off")   return handleSelfDmProgOff(interaction, link);
+  if (id === "menu:dmuseful:on")  return handleSelfDmUsefulOn(interaction, link);
+  if (id === "menu:dmuseful:off") return handleSelfDmUsefulOff(interaction, link);
 
   // Everything below is admin-only.
   if (id.startsWith("menu:admin") && !hasManageChannels(interaction)) {
@@ -1228,7 +1324,7 @@ async function handleHelp(interaction) {
           "Opens the bot menu for this channel:\n" +
           "- **Status** — preview tracker status with a **Post to channel** button.\n" +
           "- **Register** / **Unregister** — add or remove yourself from the registered view (only shown once the channel's view mode is **Registered Only**).\n" +
-          "- **Enable Progression DMs** / **Disable Progression DMs** — get a DM whenever you receive a progression item in this tracker.\n" +
+          "- **DM Notifications** — opens a submenu to toggle **Progression** and **Useful** item DMs, each sent whenever you receive that kind of item in this tracker.\n" +
           "- **Admin Actions** *(Manage Channels only)* — link/unlink this channel's tracker, switch view mode between **Show All** and **Registered Only**, or register another player.",
       },
       { name: "`/help`", value: "Show this message." },

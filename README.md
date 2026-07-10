@@ -37,7 +37,11 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 - **Status** *(Everyone)* — shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
 - **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)* — adds/removes you from the channel's **Registered Only** view.
-- **Enable Progression DMs** / **Disable Progression DMs** *(Everyone)* — opts you in/out of a DM whenever you receive a progression item in this tracker's room. Detected directly from the Archipelago room's own item data (via the tracker's linked Archipelago webhost), not just hinted items. Items you find yourself (including in any other game you claim in the same room) don't trigger a DM, only items sent to you from someone else's world do.
+- **DM Notifications** *(Everyone)* — opens a submenu with two independent toggles:
+  - **Enable/Disable Progression DMs** — opts you in/out of a DM whenever you receive a progression item in this tracker's room.
+  - **Enable/Disable Useful DMs** — opts you in/out of a DM whenever you receive a useful item in this tracker's room.
+
+  Both are detected directly from the Archipelago room's own item data (via the tracker's linked Archipelago webhost), not just hinted items. Items you find yourself (including in any other game you claim in the same room) don't trigger a DM, only items sent to you from someone else's world do.
 - **Admin Actions** *(Manage Channels)* — opens a submenu:
   - **Link Tracker** / **Update Tracker** — opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
   - **Unlink Channel** — removes the channel's link (with a confirmation step) and stops auto-refresh.
