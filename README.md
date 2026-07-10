@@ -30,12 +30,18 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 | Command | Who can use | Description |
 |---|---|---|
-| `/link <url> <mode>` | Manage Channels | Links the current channel to a CheeseTrackers room. Accepts a full URL or bare tracker ID. Mode is **Show All** or **Registered Only** (see below). Re-running it in an already-linked channel updates the link. |
-| `/status` | Everyone | Shows a status preview (visible only to you), with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it. |
-| `/viewmode <mode>` | Manage Channels | Switches an already-linked channel between **Show All** and **Registered Only**, updating any live posted messages immediately. |
-| `/register [user]` | Everyone (self); Manage Channels (others) | Adds you — or, with permission, another member — to the channel's **Registered Only** view. |
-| `/unregister` | Everyone | Removes you from the channel's **Registered Only** view. |
+| `/menu` | Everyone | Opens an ephemeral (visible only to you) button menu for the current channel. |
 | `/help` | Everyone | Shows bot info and a link to this GitHub page. |
+
+### `/menu` layout
+
+- **Status** *(Everyone)* — shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
+- **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)* — adds/removes you from the channel's **Registered Only** view.
+- **Admin Actions** *(Manage Channels)* — opens a submenu:
+  - **Link Tracker** / **Update Tracker** — opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
+  - **Unlink Channel** — removes the channel's link (with a confirmation step) and stops auto-refresh.
+  - **View Mode: Show All** / **View Mode: Registered Only** — switches the channel's view mode, updating any live posted messages immediately.
+  - **Register Someone** — picks another member (via Discord's user select menu) to add to the **Registered Only** view.
 
 ### View modes
 - **Show All** — every player's games are shown, including unclaimed slots. Best for small rooms.
@@ -57,7 +63,7 @@ Slots are sorted alphabetically and grouped by owner. Owners appear as Discord `
 | 🏁 Done | 💀 Released | 🚀 Go Mode | 🟡 Soft BK |
 | | | ❓ Unknown | |
 
-Large rooms are split across multiple embeds/messages (paged in the `/status` preview, posted as separate messages once published).
+Large rooms are split across multiple embeds/messages (paged in the **Status** preview, posted as separate messages once published).
 
 ---
 

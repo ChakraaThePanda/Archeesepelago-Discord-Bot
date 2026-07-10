@@ -11,6 +11,10 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  UserSelectMenuBuilder,
   PermissionFlagsBits,
   ActivityType,
   MessageFlags,
@@ -112,9 +116,8 @@ function progressBar(done, total) {
   return `${"█".repeat(filled)}${"░".repeat(8 - filled)} ${done}/${total} (${pct}%)`;
 }
 
-// Returns an ActionRowBuilder with Prev/Next nav (when totalPages > 1) and optionally a Post button.
-// Returns null when there would be no buttons.
-function buildStatusNavRow(trackerId, page, totalPages, includePost = false) {
+// Returns an ActionRowBuilder with Prev/Next nav (when totalPages > 1) and a Post-to-channel button.
+function buildStatusNavRow(trackerId, page, totalPages) {
   const components = [];
   if (totalPages > 1) {
     components.push(
@@ -130,16 +133,107 @@ function buildStatusNavRow(trackerId, page, totalPages, includePost = false) {
         .setDisabled(page >= totalPages - 1),
     );
   }
-  if (includePost) {
-    components.push(
-      new ButtonBuilder()
-        .setCustomId(`post:${trackerId}`)
-        .setLabel("Post to channel")
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji("📋"),
+  components.push(
+    new ButtonBuilder()
+      .setCustomId(`post:${trackerId}`)
+      .setLabel("Post to channel")
+      .setStyle(ButtonStyle.Primary),
+  );
+  return new ActionRowBuilder().addComponents(...components);
+}
+
+function backToMenuRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("menu:back").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
+  );
+}
+
+// ─── Menu (buttons) ───────────────────────────────────────────────────────────
+
+function hasManageChannels(interaction) {
+  return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels));
+}
+
+function buildMenuEmbed(link, userId, isManager) {
+  const e = new EmbedBuilder().setColor(0xf5c542).setTitle("Archeesepelago Menu");
+  if (!link) {
+    e.setDescription(
+      isManager
+        ? "This channel isn't linked to a tracker yet.\nUse **Admin Actions** below to link one."
+        : "This channel isn't linked to a tracker yet.\nAsk a server admin to link one."
+    );
+    return e;
+  }
+
+  const trackerUrl = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${link.trackerId}`;
+  const isRegisteredMode = (link.mode ?? "all") === "registered";
+  const modeLabel = isRegisteredMode ? "**Registered Only**" : "**Show All**";
+
+  const lines = [`**[Tracker Room](${trackerUrl})**`, `View mode: ${modeLabel}`];
+  if (isRegisteredMode) {
+    const isRegistered = (link.registeredUsers ?? []).includes(userId);
+    lines.push(isRegistered ? "You are: ✅ **Registered**" : "You are: ❌ **Not registered**");
+  }
+
+  e.setDescription(lines.join("\n"));
+  return e;
+}
+
+function buildMainMenuRows(interaction, link) {
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:status").setLabel("Status").setStyle(ButtonStyle.Success).setDisabled(!link)
+    ),
+  ];
+
+  if (link && (link.mode ?? "all") === "registered") {
+    const isRegistered = (link.registeredUsers ?? []).includes(interaction.user.id);
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        isRegistered
+          ? new ButtonBuilder().setCustomId("menu:unregister").setLabel("Unregister").setStyle(ButtonStyle.Danger)
+          : new ButtonBuilder().setCustomId("menu:register").setLabel("Register").setStyle(ButtonStyle.Success)
+      )
     );
   }
-  return components.length > 0 ? new ActionRowBuilder().addComponents(...components) : null;
+
+  if (hasManageChannels(interaction)) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("menu:admin").setLabel("Admin Actions").setStyle(ButtonStyle.Primary)
+      )
+    );
+  }
+
+  return rows;
+}
+
+function buildAdminMenuRows(link) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:admin:link").setLabel(link ? "Update Tracker" : "Link Tracker").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("menu:admin:unlink").setLabel("Unlink Channel").setStyle(ButtonStyle.Danger).setDisabled(!link),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:admin:viewmode:all").setLabel("View Mode: Show All").setStyle(ButtonStyle.Primary).setDisabled(!link || (link.mode ?? "all") === "all"),
+      new ButtonBuilder().setCustomId("menu:admin:viewmode:registered").setLabel("View Mode: Registered Only").setStyle(ButtonStyle.Primary).setDisabled(!link || link.mode === "registered"),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:admin:registeruser").setLabel("Register Someone").setStyle(ButtonStyle.Primary).setDisabled(!link)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:back").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+function buildUnlinkConfirmRows() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:admin:unlink:confirm").setLabel("Yes, unlink").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("menu:admin:unlink:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    ),
+  ];
 }
 
 // ─── Auto-refresh ─────────────────────────────────────────────────────────────
@@ -328,7 +422,7 @@ async function buildStatusPages(trackerId, data, guild, refreshStatus = null, mo
   }
 
   if (mode === "registered" && blocks.length === 0) {
-    blocks.push("*No one is registered yet.*\nUse `/register` to add your games to this view.");
+    blocks.push("*No one is registered yet.*\nUse `/menu` → **Register** to add your games to this view.");
   }
 
   const trackerUrl = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${trackerId}`;
@@ -413,54 +507,8 @@ async function buildStatusPages(trackerId, data, guild, refreshStatus = null, mo
 
 const commands = [
   new SlashCommandBuilder()
-    .setName("link")
-    .setDescription("[Permissions Needed] Link this channel to a CheeseTrackers room")
-    .addStringOption(opt =>
-      opt.setName("url")
-        .setDescription("CheeseTrackers URL or tracker ID")
-        .setRequired(true)
-    )
-    .addStringOption(opt =>
-      opt.setName("mode")
-        .setDescription("Which players to display — pick carefully for big rooms")
-        .setRequired(true)
-        .addChoices(
-          { name: "Show All — display every player and unclaimed games", value: "all" },
-          { name: "Registered Only — show only players who used /register", value: "registered" },
-        )
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
-
-  new SlashCommandBuilder()
-    .setName("status")
-    .setDescription("Show tracker status for this linked channel"),
-
-  new SlashCommandBuilder()
-    .setName("viewmode")
-    .setDescription("[Permissions Needed] Switch between showing all players or only registered ones")
-    .addStringOption(opt =>
-      opt.setName("mode")
-        .setDescription("The view mode to use")
-        .setRequired(true)
-        .addChoices(
-          { name: "Show All — display every player and unclaimed games", value: "all" },
-          { name: "Registered Only — show only players who used /register", value: "registered" },
-        )
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
-
-  new SlashCommandBuilder()
-    .setName("register")
-    .setDescription("Add yourself (or another user) to this channel's registered tracker view")
-    .addUserOption(opt =>
-      opt.setName("user")
-        .setDescription("[Permissions Needed] Register someone else instead of yourself")
-        .setRequired(false)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("unregister")
-    .setDescription("Remove yourself from this channel's registered tracker view"),
+    .setName("menu")
+    .setDescription("Open the bot menu for this channel"),
 
   new SlashCommandBuilder()
     .setName("help")
@@ -469,96 +517,47 @@ const commands = [
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-async function handleLink(interaction) {
-  const channel = interaction.channel;
-  const input   = interaction.options.getString("url");
-  const mode    = interaction.options.getString("mode");
-
-  let trackerId;
-  try {
-    trackerId = parseTrackerId(input);
-  } catch (err) {
-    return interaction.reply({ content: `❌ Invalid URL: ${err.message}`, flags: MessageFlags.Ephemeral });
-  }
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  let data;
-  try {
-    data = await ctGet(`/tracker/${trackerId}`);
-  } catch (err) {
-    return interaction.editReply(`❌ Could not reach that tracker: ${err.message}`);
-  }
-
-  const links    = loadLinks();
-  const key      = linkKey(interaction.guildId, channel.id);
-  const isUpdate = Boolean(links[key]);
-  links[key]     = { trackerId, linkedAt: Date.now(), mode };
-  saveLinks(links);
-
-  const verb        = isUpdate ? "updated to" : "linked to";
-  const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
-  const modeLabel    = mode === "all" ? "**Show All**" : "**Registered Only**";
-
-  let warning = "";
-  if (mode === "all" && playerCount >= 20) {
-    warning = `\n\n⚠️ **Big world warning:** this room has **${playerCount}** players. **Show All** posts every player's games, which can spread across many embeds/pages and spam the channel on every update. Consider \`/viewmode\` → **Registered Only** so only the players who \`/register\` show up.`;
-  }
-
-  await interaction.editReply(
-    `✅ **#${channel.name}** is now ${verb} tracker \`${trackerId}\` in ${modeLabel} mode.\nRun \`/status\` here to see progress.${warning}`
-  );
-}
-
-async function handleStatus(interaction) {
+async function handleMenuCommand(interaction) {
   const links = loadLinks();
   const link  = links[linkKey(interaction.guildId, interaction.channelId)];
 
+  await interaction.reply({
+    embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))],
+    components: buildMainMenuRows(interaction, link),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleMenuStatus(interaction, link) {
   if (!link) {
     return interaction.reply({
-      content: "❌ This channel isn't linked to a CheeseTrackers room. Use `/link` first.",
+      content: hasManageChannels(interaction)
+        ? "❌ This channel isn't linked to a tracker yet. Open **Admin Actions → Link Tracker** first."
+        : "❌ This channel isn't linked to a tracker yet. Ask a server admin to link one.",
       flags: MessageFlags.Ephemeral,
     });
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  await interaction.deferUpdate();
+  await interaction.editReply({ content: "Loading tracker...", embeds: [], components: [] });
 
   let data;
   try {
     data = await ctGet(`/tracker/${link.trackerId}`);
   } catch (err) {
-    console.error("[status] CT API fetch failed:", err);
-    return interaction.editReply(`❌ Failed to fetch tracker data: ${err.message}`);
+    console.error("[menu:status] CT API fetch failed:", err);
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
   if (!Array.isArray(data?.games)) {
-    console.error("[status] Unexpected CT API response:", JSON.stringify(data).slice(0, 500));
-    return interaction.editReply("❌ Unexpected response from CheeseTrackers — the tracker may be unavailable.");
+    console.error("[menu:status] Unexpected CT API response:", JSON.stringify(data).slice(0, 500));
+    return interaction.followUp({ content: "❌ Unexpected response from CheeseTrackers — the tracker may be unavailable.", flags: MessageFlags.Ephemeral });
   }
 
-  let pages;
-  try {
-    pages = await buildStatusPages(link.trackerId, data, interaction.guild, null, link.mode ?? "all", link.registeredUsers ?? []);
-  } catch (err) {
-    console.error("[status] buildStatusPages failed:", err);
-    return interaction.editReply(`❌ Failed to build tracker display: ${err.message}`);
-  }
+  const pages  = await buildStatusPages(link.trackerId, data, interaction.guild, null, link.mode ?? "all", link.registeredUsers ?? []);
+  const navRow = buildStatusNavRow(link.trackerId, 0, pages.length);
 
-  const row = buildStatusNavRow(link.trackerId, 0, pages.length, true);
-
-  try {
-    await interaction.editReply({
-      embeds: [pages[0]],
-      components: row ? [row] : [],
-    });
-  } catch (err) {
-    console.error("[status] editReply failed:", err);
-    return interaction.editReply({
-      content: `❌ Failed to send tracker display: ${err.message}`,
-      embeds: [],
-      components: [],
-    });
-  }
+  await interaction.editReply({ content: null, embeds: [pages[0]], components: [navRow, backToMenuRow()] });
 }
 
 async function handlePageButton(interaction) {
@@ -577,12 +576,11 @@ async function handlePageButton(interaction) {
   const links = loadLinks();
   const link  = links[linkKey(interaction.guildId, interaction.channelId)];
 
-  // pg: buttons only appear on the ephemeral /status preview — always include Post button
   const pages = await buildStatusPages(trackerId, data, interaction.guild, null, link?.mode ?? "all", link?.registeredUsers ?? []);
   const page  = Math.max(0, Math.min(dir === "n" ? fromPage + 1 : fromPage - 1, pages.length - 1));
-  const row   = buildStatusNavRow(trackerId, page, pages.length, true);
+  const row   = buildStatusNavRow(trackerId, page, pages.length);
 
-  await interaction.editReply({ embeds: [pages[page]], components: row ? [row] : [] });
+  await interaction.editReply({ embeds: [pages[page]], components: [row, backToMenuRow()] });
 }
 
 async function handlePostButton(interaction) {
@@ -630,195 +628,286 @@ async function handlePostButton(interaction) {
     saveLinks(links);
   }
 
-  await interaction.editReply({ content: "✅ Posted!", embeds: [], components: [] });
+  await interaction.editReply({ content: "✅ Posted!", embeds: [], components: [backToMenuRow()] });
 }
 
-async function handleViewMode(interaction) {
-  const links = loadLinks();
-  const key   = linkKey(interaction.guildId, interaction.channelId);
-  const link  = links[key];
-
-  if (!link) {
-    return interaction.reply({
-      content: "❌ This channel isn't linked to a tracker. Use `/link` first.",
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const newMode = interaction.options.getString("mode");
-  link.mode = newMode;
-  saveLinks(links);
-
-  // Immediately refresh any live posted messages
+// Shared by self-register, self-unregister, and admin register-someone.
+async function refreshRegisteredView(interaction, link) {
   const session = activeRefreshes.get(interaction.channelId);
-  if (session) {
-    session.mode = newMode;
-    try {
-      const data     = await ctGet(`/tracker/${link.trackerId}`);
-      const pages    = await buildStatusPages(link.trackerId, data, interaction.guild, "active", newMode, session.registeredUserIds);
-      const oldCount = session.messages.length;
-      const newCount = pages.length;
+  if (!session || (link.mode ?? "all") !== "registered") return;
 
-      // Edit existing messages
-      for (let i = 0; i < Math.min(newCount, oldCount); i++) {
-        try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
-        catch { /* message gone */ }
-      }
-
-      // Delete surplus messages if page count shrank
-      for (let i = newCount; i < oldCount; i++) {
-        try { await session.messages[i].delete(); }
-        catch { /* already gone */ }
-      }
-      if (newCount < oldCount) session.messages = session.messages.slice(0, newCount);
-
-      // Post new messages if page count grew
-      for (let i = session.messages.length; i < newCount; i++) {
-        const msg = await interaction.channel.send({ embeds: [pages[i]] });
-        session.messages.push(msg);
-      }
-
-      // Persist updated messageIds if count changed
-      if (newCount !== oldCount) {
-        link.messageIds = session.messages.map(m => m.id);
-        saveLinks(links);
-      }
-    } catch (err) {
-      console.warn("[viewmode] refresh failed:", err.message);
+  session.registeredUserIds = [...(link.registeredUsers ?? [])];
+  try {
+    const data  = await ctGet(`/tracker/${link.trackerId}`);
+    const pages = await buildStatusPages(link.trackerId, data, interaction.guild, "active", "registered", session.registeredUserIds);
+    for (let i = 0; i < session.messages.length; i++) {
+      if (!pages[i]) break;
+      try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
+      catch { /* message gone */ }
     }
+  } catch (err) {
+    console.warn("[refreshRegisteredView] failed:", err.message);
   }
-
-  const label = newMode === "all" ? "**Show All**" : "**Registered Only**";
-  const hint  = newMode === "registered" ? "\n> Players can use `/register` to add their games to this view." : "";
-
-  let warning = "";
-  if (newMode === "all") {
-    try {
-      const data        = await ctGet(`/tracker/${link.trackerId}`);
-      const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
-      if (playerCount >= 20) {
-        warning = `\n\n⚠️ **Big world warning:** this room has **${playerCount}** players. **Show All** posts every player's games, which can spread across many embeds/pages and spam the channel on every update. Consider **Registered Only** so only the players who \`/register\` show up.`;
-      }
-    } catch { /* non-critical — skip warning if tracker fetch fails */ }
-  }
-
-  await interaction.editReply(`✅ View mode set to ${label}.${hint}${warning}`);
 }
 
-async function handleRegister(interaction) {
-  const links = loadLinks();
-  const key   = linkKey(interaction.guildId, interaction.channelId);
-  const link  = links[key];
-
+async function handleSelfRegister(interaction, link) {
   if (!link) {
-    return interaction.reply({
-      content: "❌ This channel isn't linked to a tracker. Use `/link` first.",
-      flags: MessageFlags.Ephemeral,
-    });
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
   }
 
-  const targetUser = interaction.options.getUser("user");
+  const links     = loadLinks();
+  const freshLink = links[linkKey(interaction.guildId, interaction.channelId)];
+  if (!freshLink.registeredUsers) freshLink.registeredUsers = [];
 
-  if (targetUser) {
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
-      return interaction.reply({
-        content: "❌ You need **Manage Channels** permission to register someone else.",
-        flags: MessageFlags.Ephemeral,
-      });
-    }
+  const userId = interaction.user.id;
+  if (freshLink.registeredUsers.includes(userId)) {
+    return interaction.reply({ content: "✅ You're already registered in this channel's tracker view.", flags: MessageFlags.Ephemeral });
   }
 
-  const userId   = targetUser ? targetUser.id : interaction.user.id;
-  const isSelf   = !targetUser;
-  const mention  = targetUser ? `<@${targetUser.id}>` : "You";
-  const already  = isSelf ? "You're already registered" : `${mention} is already registered`;
-
-  if (!link.registeredUsers) link.registeredUsers = [];
-
-  if (link.registeredUsers.includes(userId)) {
-    return interaction.reply({
-      content: `✅ ${already} in this channel's tracker view.`,
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  link.registeredUsers.push(userId);
+  freshLink.registeredUsers.push(userId);
   saveLinks(links);
-
-  // Refresh live messages if the channel is currently in registered mode
-  const session = activeRefreshes.get(interaction.channelId);
-  if (session && (link.mode ?? "all") === "registered") {
-    session.registeredUserIds = [...link.registeredUsers];
-    try {
-      const data  = await ctGet(`/tracker/${link.trackerId}`);
-      const pages = await buildStatusPages(link.trackerId, data, interaction.guild, "active", "registered", session.registeredUserIds);
-      for (let i = 0; i < session.messages.length; i++) {
-        if (!pages[i]) break;
-        try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
-        catch { /* message gone */ }
-      }
-    } catch (err) {
-      console.warn("[register] refresh failed:", err.message);
-    }
-  }
-
-  const successMsg = isSelf
-    ? "✅ Registered! Your games will appear in this channel when the view is set to **Registered Only**."
-    : `✅ ${mention} has been registered in this channel's tracker view.`;
+  await refreshRegisteredView(interaction, freshLink);
 
   await interaction.reply({
-    content: successMsg,
+    content: "✅ Registered! Your games will appear in this channel's tracker view.",
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleUnregister(interaction) {
-  const links = loadLinks();
-  const key   = linkKey(interaction.guildId, interaction.channelId);
-  const link  = links[key];
-
+async function handleSelfUnregister(interaction, link) {
   if (!link) {
-    return interaction.reply({
-      content: "❌ This channel isn't linked to a tracker. Use `/link` first.",
-      flags: MessageFlags.Ephemeral,
-    });
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
   }
 
-  const userId = interaction.user.id;
-  const idx = (link.registeredUsers ?? []).indexOf(userId);
+  const links     = loadLinks();
+  const freshLink = links[linkKey(interaction.guildId, interaction.channelId)];
+  const userId    = interaction.user.id;
+  const idx       = (freshLink.registeredUsers ?? []).indexOf(userId);
+
   if (idx === -1) {
-    return interaction.reply({
-      content: "❌ You're not registered in this channel's tracker view.",
-      flags: MessageFlags.Ephemeral,
-    });
+    return interaction.reply({ content: "❌ You're not registered in this channel's tracker view.", flags: MessageFlags.Ephemeral });
   }
 
-  link.registeredUsers.splice(idx, 1);
+  freshLink.registeredUsers.splice(idx, 1);
   saveLinks(links);
-
-  // Refresh live messages if the channel is currently in registered mode
-  const session = activeRefreshes.get(interaction.channelId);
-  if (session && (link.mode ?? "all") === "registered") {
-    session.registeredUserIds = [...link.registeredUsers];
-    try {
-      const data  = await ctGet(`/tracker/${link.trackerId}`);
-      const pages = await buildStatusPages(link.trackerId, data, interaction.guild, "active", "registered", session.registeredUserIds);
-      for (let i = 0; i < session.messages.length; i++) {
-        if (!pages[i]) break;
-        try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
-        catch { /* message gone */ }
-      }
-    } catch (err) {
-      console.warn("[unregister] refresh failed:", err.message);
-    }
-  }
+  await refreshRegisteredView(interaction, freshLink);
 
   await interaction.reply({
     content: "✅ Unregistered. Your games will no longer appear in this channel's registered view.",
     flags: MessageFlags.Ephemeral,
   });
+}
+
+async function showLinkModal(interaction) {
+  const modal = new ModalBuilder()
+    .setCustomId("modal:link")
+    .setTitle("Link Tracker")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("url")
+          .setLabel("CheeseTrackers URL or tracker ID")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      )
+    );
+
+  await interaction.showModal(modal);
+}
+
+async function handleLinkModalSubmit(interaction) {
+  const input = interaction.fields.getTextInputValue("url");
+
+  let trackerId;
+  try {
+    trackerId = parseTrackerId(input);
+  } catch (err) {
+    return interaction.reply({ content: `❌ Invalid URL: ${err.message}`, flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${trackerId}`);
+  } catch (err) {
+    return interaction.editReply(`❌ Could not reach that tracker: ${err.message}`);
+  }
+
+  const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
+  const warning = playerCount >= 20
+    ? `\n\n⚠️ **Big world warning:** this room has **${playerCount}** players. Pick **Registered Only** below to avoid flooding the channel on every update.`
+    : "";
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`menu:admin:linkmode:all:${trackerId}`).setLabel("Show All").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`menu:admin:linkmode:registered:${trackerId}`).setLabel("Registered Only").setStyle(ButtonStyle.Primary),
+  );
+
+  await interaction.editReply({
+    content: `Found tracker \`${trackerId}\` — **${playerCount}** players.\nPick a view mode to finish linking:${warning}`,
+    components: [row],
+  });
+}
+
+async function handleLinkModeButton(interaction, mode, trackerId) {
+  const channel  = interaction.channel;
+  const links    = loadLinks();
+  const key      = linkKey(interaction.guildId, channel.id);
+  const isUpdate = Boolean(links[key]);
+  links[key]     = { trackerId, linkedAt: Date.now(), mode };
+  saveLinks(links);
+
+  const modeLabel  = mode === "all" ? "**Show All**" : "**Registered Only**";
+  const trackerUrl = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${trackerId}`;
+  await interaction.update({
+    content: `✅ **#${channel.name}** is now ${isUpdate ? "updated to" : "linked to"} [this tracker](${trackerUrl}) in ${modeLabel} mode.`,
+    components: [],
+  });
+}
+
+async function handleUnlinkConfirm(interaction) {
+  stopAutoRefresh(interaction.channelId);
+  deleteLinkEntry(interaction.guildId, interaction.channelId);
+
+  await interaction.update({
+    embeds: [buildMenuEmbed(null, interaction.user.id, hasManageChannels(interaction))],
+    components: buildMainMenuRows(interaction, null),
+  });
+}
+
+async function handleAdminViewMode(interaction, link, mode) {
+  if (!link) {
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferUpdate();
+
+  const links     = loadLinks();
+  const key       = linkKey(interaction.guildId, interaction.channelId);
+  const freshLink = links[key];
+  freshLink.mode  = mode;
+  saveLinks(links);
+
+  // Immediately refresh any live posted messages
+  const session = activeRefreshes.get(interaction.channelId);
+  if (session) {
+    session.mode = mode;
+    try {
+      const data     = await ctGet(`/tracker/${freshLink.trackerId}`);
+      const pages    = await buildStatusPages(freshLink.trackerId, data, interaction.guild, "active", mode, session.registeredUserIds);
+      const oldCount = session.messages.length;
+      const newCount = pages.length;
+
+      for (let i = 0; i < Math.min(newCount, oldCount); i++) {
+        try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
+        catch { /* message gone */ }
+      }
+      for (let i = newCount; i < oldCount; i++) {
+        try { await session.messages[i].delete(); }
+        catch { /* already gone */ }
+      }
+      if (newCount < oldCount) session.messages = session.messages.slice(0, newCount);
+      for (let i = session.messages.length; i < newCount; i++) {
+        const msg = await interaction.channel.send({ embeds: [pages[i]] });
+        session.messages.push(msg);
+      }
+      if (newCount !== oldCount) {
+        freshLink.messageIds = session.messages.map(m => m.id);
+        saveLinks(links);
+      }
+    } catch (err) {
+      console.warn("[menu:admin:viewmode] refresh failed:", err.message);
+    }
+  }
+
+  await interaction.editReply({ embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))], components: buildAdminMenuRows(freshLink) });
+
+  if (mode === "all") {
+    try {
+      const data        = await ctGet(`/tracker/${freshLink.trackerId}`);
+      const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
+      if (playerCount >= 20) {
+        await interaction.followUp({
+          content: `⚠️ **Big world warning:** this room has **${playerCount}** players. **Show All** posts every player's games, which can spread across many embeds/pages and spam the channel on every update.`,
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+    } catch { /* non-critical — skip warning if tracker fetch fails */ }
+  }
+}
+
+async function handleRegisterUserSelect(interaction) {
+  if (!hasManageChannels(interaction)) {
+    return interaction.reply({ content: "❌ You need **Manage Channels** permission.", flags: MessageFlags.Ephemeral });
+  }
+
+  const links = loadLinks();
+  const key   = linkKey(interaction.guildId, interaction.channelId);
+  const link  = links[key];
+
+  if (!link) {
+    return interaction.update({ content: "❌ This channel isn't linked to a tracker.", embeds: [], components: [] });
+  }
+
+  const targetId = interaction.values[0];
+  if (!link.registeredUsers) link.registeredUsers = [];
+  const already = link.registeredUsers.includes(targetId);
+
+  if (!already) {
+    link.registeredUsers.push(targetId);
+    saveLinks(links);
+    await refreshRegisteredView(interaction, link);
+  }
+
+  await interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildAdminMenuRows(link) });
+  await interaction.followUp({
+    content: already ? `✅ <@${targetId}> is already registered.` : `✅ <@${targetId}> has been registered in this channel's tracker view.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleMenuButton(interaction) {
+  const id    = interaction.customId;
+  const links = loadLinks();
+  const link  = links[linkKey(interaction.guildId, interaction.channelId)];
+
+  if (id === "menu:back")       return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildMainMenuRows(interaction, link) });
+  if (id === "menu:status")     return handleMenuStatus(interaction, link);
+  if (id === "menu:register")   return handleSelfRegister(interaction, link);
+  if (id === "menu:unregister") return handleSelfUnregister(interaction, link);
+
+  // Everything below is admin-only.
+  if (id.startsWith("menu:admin") && !hasManageChannels(interaction)) {
+    return interaction.reply({ content: "❌ You need **Manage Channels** permission.", flags: MessageFlags.Ephemeral });
+  }
+
+  if (id === "menu:admin")               return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, true)], components: buildAdminMenuRows(link) });
+  if (id === "menu:admin:link")          return showLinkModal(interaction);
+  if (id === "menu:admin:unlink")        return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, true)], components: buildUnlinkConfirmRows() });
+  if (id === "menu:admin:unlink:confirm") return handleUnlinkConfirm(interaction);
+  if (id === "menu:admin:unlink:cancel")  return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, true)], components: buildAdminMenuRows(link) });
+
+  if (id === "menu:admin:viewmode:all")        return handleAdminViewMode(interaction, link, "all");
+  if (id === "menu:admin:viewmode:registered") return handleAdminViewMode(interaction, link, "registered");
+
+  if (id === "menu:admin:registeruser") {
+    const selectRow = new ActionRowBuilder().addComponents(
+      new UserSelectMenuBuilder().setCustomId("menu:admin:registeruser:select").setPlaceholder("Choose a user to register").setMinValues(1).setMaxValues(1)
+    );
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu:admin").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
+    );
+    return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, true)], components: [selectRow, backRow] });
+  }
+
+  if (id.startsWith("menu:admin:linkmode:")) {
+    const rest      = id.slice("menu:admin:linkmode:".length);
+    const sep       = rest.indexOf(":");
+    const mode      = rest.slice(0, sep);
+    const trackerId = rest.slice(sep + 1);
+    return handleLinkModeButton(interaction, mode, trackerId);
+  }
 }
 
 async function handleHelp(interaction) {
@@ -830,13 +919,16 @@ async function handleHelp(interaction) {
       "Posts Archipelago multiworld room status from CheeseTrackers into Discord."
     )
     .addFields(
-      { name: "`/link <url> <mode>`", value: "Link this channel to a CheeseTrackers room. Pick a view mode when you link: **Show All** shows every player, **Registered Only** shows just the players who've used `/register`. For big rooms with lots of players, use **Registered Only** so the channel doesn't get flooded. Requires **Manage Channels** permission." },
-      { name: "`/status`",        value: "Show a tracker status preview with a **Post to channel** button." },
-      { name: "`/viewmode`",      value: "Switch between **Show All** (default) and **Registered Only** view. Requires **Manage Channels** permission." },
-      { name: "`/register`",      value: "Add yourself to this channel's registered tracker view. With **Manage Channels** permission, use `/register user:@someone` to register another player." },
-      { name: "`/unregister`",    value: "Remove yourself from this channel's registered tracker view." },
-      { name: "`/help`",          value: "Show this message." },
-      { name: "GitHub",           value: "[github.com/ChakraaThePanda/Archeesepelago-Discord-Bot](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot)" },
+      {
+        name: "`/menu`",
+        value:
+          "Opens the bot menu for this channel:\n" +
+          "- **Status** — preview tracker status with a **Post to channel** button.\n" +
+          "- **Register** / **Unregister** — add or remove yourself from the registered view (only shown once the channel's view mode is **Registered Only**).\n" +
+          "- **Admin Actions** *(Manage Channels only)* — link/unlink this channel's tracker, switch view mode between **Show All** and **Registered Only**, or register another player.",
+      },
+      { name: "`/help`", value: "Show this message." },
+      { name: "GitHub",  value: "[github.com/ChakraaThePanda/Archeesepelago-Discord-Bot](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot)" },
     );
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -946,16 +1038,19 @@ client.on("shardResume", () => { setPresence(); });
 client.on("interactionCreate", async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "link")       return await handleLink(interaction);
-      if (interaction.commandName === "status")     return await handleStatus(interaction);
-      if (interaction.commandName === "viewmode")   return await handleViewMode(interaction);
-      if (interaction.commandName === "register")   return await handleRegister(interaction);
-      if (interaction.commandName === "unregister") return await handleUnregister(interaction);
-      if (interaction.commandName === "help")       return await handleHelp(interaction);
+      if (interaction.commandName === "menu") return await handleMenuCommand(interaction);
+      if (interaction.commandName === "help") return await handleHelp(interaction);
     }
     if (interaction.isButton()) {
       if (interaction.customId.startsWith("pg:"))   return await handlePageButton(interaction);
       if (interaction.customId.startsWith("post:")) return await handlePostButton(interaction);
+      if (interaction.customId.startsWith("menu:")) return await handleMenuButton(interaction);
+    }
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === "modal:link") return await handleLinkModalSubmit(interaction);
+    }
+    if (interaction.isUserSelectMenu()) {
+      if (interaction.customId === "menu:admin:registeruser:select") return await handleRegisterUserSelect(interaction);
     }
   } catch (err) {
     if (err.code === 10062) return; // interaction expired (e.g. bot restarted mid-flight) — nothing to do
