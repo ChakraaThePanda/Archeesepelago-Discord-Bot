@@ -30,7 +30,10 @@ const BASE_URL      = "https://cheesetrackers.theincrediblewheelofchee.se/api";
 const LINKS_FILE    = path.join(__dirname, "links.json");
 
 // ─── Persistent Links (JSON) ──────────────────────────────────────────────────
-// Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?, lastActivityAt? } }
+// Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?,
+//   lastActivityAt?, progressionDmUsers?, progressionItemCounts? } }
+// progressionDmUsers: Discord user IDs opted in to Progression DMs for this channel's tracker.
+// progressionItemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only.
 
 function loadLinks() {
   if (!fs.existsSync(LINKS_FILE)) return {};
@@ -39,6 +42,23 @@ function loadLinks() {
 
 function saveLinks(links) {
   fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2));
+}
+
+// Serializes every links.json read-modify-write cycle. Without this, two handlers that each do
+// loadLinks() -> (await something) -> saveLinks() can interleave: both load the same on-disk
+// state, and whichever saves last silently overwrites the other's change. `mutator` gets the
+// freshly-loaded links object to read/mutate (it may itself be async), and its return value is
+// passed through as this call's result.
+let linksQueue = Promise.resolve();
+function withLinks(mutator) {
+  const run = linksQueue.then(async () => {
+    const links  = loadLinks();
+    const result = await mutator(links);
+    saveLinks(links);
+    return result;
+  });
+  linksQueue = run.then(() => {}, () => {});
+  return run;
 }
 
 function linkKey(guildId, channelId) {
@@ -57,6 +77,161 @@ async function ctGet(endpoint) {
   const res = await fetch(`${BASE_URL}${endpoint}`, { headers: ctHeaders() });
   if (!res.ok) throw new Error(`CheeseTrackers API returned ${res.status}`);
   return res.json();
+}
+
+// ─── Archipelago webhost API (progression item DMs) ────────────────────────────
+// Public, unauthenticated JSON API exposed by the AP webhost itself (e.g. archipelago.gg),
+// discovered via the CheeseTrackers tracker's `upstream_url` field. Confirmed against
+// ArchipelagoMW/Archipelago's WebHostLib/api/tracker.py and BaseClasses.py.
+
+const PROGRESSION_FLAG = 0b00001; // ItemClassification.progression bit
+
+function deriveApTrackerInfo(upstreamUrl) {
+  const url = new URL(upstreamUrl);
+  const segments = url.pathname.split("/").filter(Boolean);
+  const apTrackerId = segments[segments.length - 1];
+  if (!apTrackerId) throw new Error("No tracker ID found in upstream_url");
+  return { origin: url.origin, apTrackerId };
+}
+
+async function apGet(origin, endpoint) {
+  const res = await fetch(`${origin}${endpoint}`);
+  if (!res.ok) throw new Error(`Archipelago webhost API returned ${res.status}`);
+  return res.json();
+}
+
+// Cache of datapackage item-id -> item-name maps, keyed by `${game}::${checksum}`.
+// Safe to keep for the process lifetime — a checksum uniquely identifies a datapackage version.
+const datapackageCache = new Map();
+
+async function getItemIdToNameMap(origin, game, checksum) {
+  const key = `${game}::${checksum}`;
+  if (datapackageCache.has(key)) return datapackageCache.get(key);
+
+  const pkg = await apGet(origin, `/api/datapackage/${checksum}`);
+  const idToName = {};
+  for (const [name, id] of Object.entries(pkg.item_name_to_id ?? {})) idToName[id] = name;
+  datapackageCache.set(key, idToName);
+  return idToName;
+}
+
+// Diffs each opted-in user's received items against the link's progressionItemCounts and DMs
+// them for any newly-received item flagged as progression. Looks the link up fresh (by `key`)
+// itself, inside withLinks, right before persisting — the network fetches below all happen
+// before that lock is taken, so this never holds up other menu actions for longer than the
+// synchronous diff. Never throws — failures are logged and treated as "no update".
+async function checkNewProgressionItems(data, guild, key) {
+  const peek = loadLinks()[key];
+  if (!peek?.progressionDmUsers?.length) return;
+
+  let apInfo;
+  try {
+    apInfo = deriveApTrackerInfo(data.upstream_url);
+  } catch (err) {
+    console.warn("[progression-dm] Could not derive AP tracker info:", err.message);
+    return;
+  }
+
+  let trackerData, staticData, memberByUsername;
+  try {
+    [trackerData, staticData, memberByUsername] = await Promise.all([
+      apGet(apInfo.origin, `/api/tracker/${apInfo.apTrackerId}`),
+      apGet(apInfo.origin, `/api/static_tracker/${apInfo.apTrackerId}`),
+      buildMemberByUsernameMap(guild),
+    ]);
+  } catch (err) {
+    console.warn("[progression-dm] AP webhost fetch failed:", err.message);
+    return;
+  }
+
+  const playerItemsReceived = trackerData.player_items_received ?? [];
+  if (!playerItemsReceived.length) return;
+
+  // O(1) position lookups instead of scanning `data.games` per entry/item — this room type can
+  // have 1000+ slots, and the old .find() calls ran once per changed slot plus once per item.
+  const gameByPosition = new Map((data.games ?? []).map(g => [g.position, g]));
+
+  const pending = [];
+
+  await withLinks(links => {
+    const link = links[key];
+    if (!link?.progressionDmUsers?.length) return;
+
+    if (!link.progressionItemCounts) link.progressionItemCounts = {};
+    const counts = link.progressionItemCounts;
+
+    for (const entry of playerItemsReceived) {
+      const position  = entry.player;
+      const items     = entry.items ?? [];
+      const prevCount = counts[position];
+
+      if (prevCount === undefined) {
+        // First time observing this slot — establish a baseline, don't backfill DMs.
+        counts[position] = items.length;
+        continue;
+      }
+
+      if (items.length <= prevCount) continue;
+      const newItems = items.slice(prevCount);
+      counts[position] = items.length;
+
+      const game = gameByPosition.get(position);
+      if (!game?.effective_discord_username) continue;
+      const member = memberByUsername.get(game.effective_discord_username.toLowerCase());
+      if (!member || !link.progressionDmUsers.includes(member.id)) continue;
+
+      const checksum = staticData?.datapackage?.[game.game]?.checksum;
+      if (!checksum) continue;
+
+      for (const netItem of newItems) {
+        // NetworkItem tuple is [item, location, player, flags]. Here `player` is the SENDING
+        // player (the world where the check happened), not the receiver. If that slot is claimed
+        // by the same Discord user (even a different one of their games), they found it
+        // themselves and already saw it live, so skip the DM.
+        const [itemId, , senderPlayer, flags = 0] = netItem;
+        if (!(flags & PROGRESSION_FLAG)) continue;
+
+        const senderGame = gameByPosition.get(senderPlayer);
+        const senderUsername = senderGame?.effective_discord_username?.toLowerCase();
+        const senderMember = senderUsername ? memberByUsername.get(senderUsername) : null;
+        if (senderMember && senderMember.id === member.id) continue;
+
+        pending.push({ member, game, senderGame, senderPlayer, itemId, checksum, trackerId: link.trackerId, title: data.title });
+      }
+    }
+  });
+
+  // Datapackage lookups and the actual DM sends happen after the lock is released — no reason
+  // to make other links.json operations wait on Discord API calls.
+  for (const p of pending) {
+    let idToName;
+    try {
+      idToName = await getItemIdToNameMap(apInfo.origin, p.game.game, p.checksum);
+    } catch (err) {
+      console.warn(`[progression-dm] Failed to load datapackage for ${p.game.game}:`, err.message);
+      continue;
+    }
+
+    const itemName    = idToName[p.itemId] ?? `Item #${p.itemId}`;
+    const senderLabel = p.senderGame ? `${p.senderGame.game} (${p.senderGame.name})` : `Player ${p.senderPlayer}`;
+    const trackerUrl  = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${p.trackerId}`;
+
+    const embed = new EmbedBuilder()
+      .setColor(0xaf99ef)
+      .setTitle("Progression Item Received")
+      .setDescription(`**[${p.title}](${trackerUrl})**`)
+      .addFields(
+        { name: "Item", value: itemName },
+        { name: "Your game", value: `${p.game.game} (${p.game.name})` },
+        { name: "Found by", value: senderLabel },
+      );
+
+    try {
+      await p.member.send({ embeds: [embed] });
+    } catch (err) {
+      console.warn(`[progression-dm] Failed to DM ${p.member.id}:`, err.message);
+    }
+  }
 }
 
 const CT_HOST = "cheesetrackers.theincrediblewheelofchee.se";
@@ -106,6 +281,21 @@ async function fetchGuildMembers(guild) {
     console.warn("[fetchGuildMembers] failed, using Discord cache:", err.message);
     return guild.members.cache;
   }
+}
+
+async function buildMemberByUsernameMap(guild) {
+  const members = await fetchGuildMembers(guild);
+  const memberByUsername = new Map();
+  for (const [, member] of members) {
+    memberByUsername.set(member.user.username.toLowerCase(), member);
+    if (member.user.globalName) {
+      memberByUsername.set(member.user.globalName.toLowerCase(), member);
+    }
+    if (member.nickname) {
+      memberByUsername.set(member.nickname.toLowerCase(), member);
+    }
+  }
+  return memberByUsername;
 }
 
 function progressBar(done, total) {
@@ -175,6 +365,9 @@ function buildMenuEmbed(link, userId, isManager) {
     lines.push(isRegistered ? "You are: ✅ **Registered**" : "You are: ❌ **Not registered**");
   }
 
+  const dmOnProgression = (link.progressionDmUsers ?? []).includes(userId);
+  lines.push(`Progression item DMs: ${dmOnProgression ? "✅ **On**" : "❌ **Off**"}`);
+
   e.setDescription(lines.join("\n"));
   return e;
 }
@@ -193,6 +386,17 @@ function buildMainMenuRows(interaction, link) {
         isRegistered
           ? new ButtonBuilder().setCustomId("menu:unregister").setLabel("Unregister").setStyle(ButtonStyle.Danger)
           : new ButtonBuilder().setCustomId("menu:register").setLabel("Register").setStyle(ButtonStyle.Success)
+      )
+    );
+  }
+
+  if (link) {
+    const dmOnProgression = (link.progressionDmUsers ?? []).includes(interaction.user.id);
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        dmOnProgression
+          ? new ButtonBuilder().setCustomId("menu:dmprog:off").setLabel("Disable Progression DMs").setStyle(ButtonStyle.Danger)
+          : new ButtonBuilder().setCustomId("menu:dmprog:on").setLabel("Enable Progression DMs").setStyle(ButtonStyle.Success)
       )
     );
   }
@@ -266,28 +470,27 @@ function stopAutoRefresh(channelId) {
   activeRefreshes.delete(channelId);
 }
 
-function clearMessageFromLinks(guildId, channelId) {
-  const links = loadLinks();
-  const key   = linkKey(guildId, channelId);
-  if (links[key]) {
-    delete links[key].messageIds;
-    delete links[key].lastActivityAt;
-    saveLinks(links);
-  }
+async function clearMessageFromLinks(guildId, channelId) {
+  const key = linkKey(guildId, channelId);
+  await withLinks(links => {
+    if (links[key]) {
+      delete links[key].messageIds;
+      delete links[key].lastActivityAt;
+    }
+  });
 }
 
-function deleteLinkEntry(guildId, channelId) {
-  const links = loadLinks();
-  const key   = linkKey(guildId, channelId);
-  if (links[key]) {
+async function deleteLinkEntry(guildId, channelId) {
+  const key = linkKey(guildId, channelId);
+  await withLinks(links => {
     delete links[key];
-    saveLinks(links);
-  }
+  });
 }
 
 // messages is an array of Discord Message objects (one per posted page)
 function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastActivityAt = Date.now(), mode = "all", registeredUserIds = []) {
   const channelId = messages[0].channelId;
+  const key       = linkKey(guild.id, channelId);
   stopAutoRefresh(channelId);
 
   const session = {
@@ -311,10 +514,14 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
       if (changed) {
         session.lastHash       = newHash;
         session.lastActivityAt = now;
-        const links = loadLinks();
-        const key   = linkKey(guild.id, channelId);
-        if (links[key]) { links[key].lastActivityAt = now; saveLinks(links); }
+        await withLinks(links => {
+          if (links[key]) links[key].lastActivityAt = now;
+        });
       }
+
+      // Fetches its own data and persists progressionItemCounts internally (via withLinks), so
+      // this tick never has to hold a stale in-memory links snapshot across these awaits.
+      await checkNewProgressionItems(data, guild, key);
 
       if (now - session.lastActivityAt > INACTIVITY_TIMEOUT_MS) {
         stopAutoRefresh(channelId);
@@ -323,7 +530,7 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
           try { await session.messages[i].edit({ embeds: [pages[i] ?? pages[pages.length - 1]], components: [] }); }
           catch { /* message gone */ }
         }
-        clearMessageFromLinks(guild.id, channelId);
+        await clearMessageFromLinks(guild.id, channelId);
         return;
       }
 
@@ -338,11 +545,11 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
     } catch (err) {
       console.error("[auto-refresh]", err);
       if (err.code === 10008) {
-        clearMessageFromLinks(guild.id, channelId);
+        await clearMessageFromLinks(guild.id, channelId);
         stopAutoRefresh(channelId);
       }
       if (err.code === 10003) {
-        deleteLinkEntry(guild.id, channelId);
+        await deleteLinkEntry(guild.id, channelId);
         stopAutoRefresh(channelId);
       }
     }
@@ -354,18 +561,7 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
 async function buildStatusPages(trackerId, data, guild, refreshStatus = null, mode = "all", registeredUserIds = []) {
   const { games, title, room_host, last_port } = data;
 
-  const members = await fetchGuildMembers(guild);
-
-  const memberByUsername = new Map();
-  for (const [, member] of members) {
-    memberByUsername.set(member.user.username.toLowerCase(), member);
-    if (member.user.globalName) {
-      memberByUsername.set(member.user.globalName.toLowerCase(), member);
-    }
-    if (member.nickname) {
-      memberByUsername.set(member.nickname.toLowerCase(), member);
-    }
-  }
+  const memberByUsername = await buildMemberByUsernameMap(guild);
 
   // Group games by claimed owner; unclaimed slots go under "Unclaimed"
   const groups = new Map();
@@ -622,11 +818,14 @@ async function handlePostButton(interaction) {
   const now = Date.now();
   startAutoRefresh(messages, trackerId, interaction.guild, hashTrackerData(data), now, mode, registeredUsers);
 
-  if (link) {
-    link.messageIds     = messages.map(m => m.id);
-    link.lastActivityAt = now;
-    saveLinks(links);
-  }
+  const messageIds = messages.map(m => m.id);
+  await withLinks(freshLinks => {
+    const freshLink = freshLinks[key];
+    if (freshLink) {
+      freshLink.messageIds     = messageIds;
+      freshLink.lastActivityAt = now;
+    }
+  });
 
   await interaction.editReply({ content: "✅ Posted!", embeds: [], components: [backToMenuRow()] });
 }
@@ -655,20 +854,28 @@ async function handleSelfRegister(interaction, link) {
     return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
   }
 
-  const links     = loadLinks();
-  const freshLink = links[linkKey(interaction.guildId, interaction.channelId)];
-  if (!freshLink.registeredUsers) freshLink.registeredUsers = [];
-
   const userId = interaction.user.id;
-  if (freshLink.registeredUsers.includes(userId)) {
+  const key    = linkKey(interaction.guildId, interaction.channelId);
+
+  const { alreadyRegistered, freshLink } = await withLinks(links => {
+    const freshLink = links[key];
+    if (!freshLink.registeredUsers) freshLink.registeredUsers = [];
+    if (freshLink.registeredUsers.includes(userId)) return { alreadyRegistered: true, freshLink };
+    freshLink.registeredUsers.push(userId);
+    return { alreadyRegistered: false, freshLink };
+  });
+
+  if (alreadyRegistered) {
     return interaction.reply({ content: "✅ You're already registered in this channel's tracker view.", flags: MessageFlags.Ephemeral });
   }
 
-  freshLink.registeredUsers.push(userId);
-  saveLinks(links);
   await refreshRegisteredView(interaction, freshLink);
 
-  await interaction.reply({
+  await interaction.update({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
+    components: buildMainMenuRows(interaction, freshLink),
+  });
+  await interaction.followUp({
     content: "✅ Registered! Your games will appear in this channel's tracker view.",
     flags: MessageFlags.Ephemeral,
   });
@@ -679,28 +886,98 @@ async function handleSelfUnregister(interaction, link) {
     return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
   }
 
-  const links     = loadLinks();
-  const freshLink = links[linkKey(interaction.guildId, interaction.channelId)];
-  const userId    = interaction.user.id;
-  const idx       = (freshLink.registeredUsers ?? []).indexOf(userId);
+  const userId = interaction.user.id;
+  const key    = linkKey(interaction.guildId, interaction.channelId);
 
-  if (idx === -1) {
+  const { wasRegistered, freshLink } = await withLinks(links => {
+    const freshLink = links[key];
+    const idx       = (freshLink.registeredUsers ?? []).indexOf(userId);
+    if (idx === -1) return { wasRegistered: false, freshLink };
+    freshLink.registeredUsers.splice(idx, 1);
+    return { wasRegistered: true, freshLink };
+  });
+
+  if (!wasRegistered) {
     return interaction.reply({ content: "❌ You're not registered in this channel's tracker view.", flags: MessageFlags.Ephemeral });
   }
 
-  freshLink.registeredUsers.splice(idx, 1);
-  saveLinks(links);
   await refreshRegisteredView(interaction, freshLink);
 
-  await interaction.reply({
+  await interaction.update({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
+    components: buildMainMenuRows(interaction, freshLink),
+  });
+  await interaction.followUp({
     content: "✅ Unregistered. Your games will no longer appear in this channel's registered view.",
     flags: MessageFlags.Ephemeral,
   });
 }
 
+async function handleSelfDmProgOn(interaction, link) {
+  if (!link) {
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  const userId = interaction.user.id;
+  const key    = linkKey(interaction.guildId, interaction.channelId);
+
+  const { alreadyOn, freshLink } = await withLinks(links => {
+    const freshLink = links[key];
+    if (!freshLink.progressionDmUsers) freshLink.progressionDmUsers = [];
+    if (freshLink.progressionDmUsers.includes(userId)) return { alreadyOn: true, freshLink };
+    freshLink.progressionDmUsers.push(userId);
+    return { alreadyOn: false, freshLink };
+  });
+
+  if (alreadyOn) {
+    return interaction.reply({ content: "✅ You're already getting Progression item DMs for this tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.update({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
+    components: buildMainMenuRows(interaction, freshLink),
+  });
+  await interaction.followUp({
+    content: "✅ You'll get a DM whenever you receive a progression item in this tracker.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleSelfDmProgOff(interaction, link) {
+  if (!link) {
+    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  const userId = interaction.user.id;
+  const key    = linkKey(interaction.guildId, interaction.channelId);
+
+  const { wasOn, freshLink } = await withLinks(links => {
+    const freshLink = links[key];
+    const idx       = (freshLink.progressionDmUsers ?? []).indexOf(userId);
+    if (idx === -1) return { wasOn: false, freshLink };
+    freshLink.progressionDmUsers.splice(idx, 1);
+    return { wasOn: true, freshLink };
+  });
+
+  if (!wasOn) {
+    return interaction.reply({ content: "❌ You're not currently getting Progression item DMs for this tracker.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.update({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
+    components: buildMainMenuRows(interaction, freshLink),
+  });
+  await interaction.followUp({
+    content: "✅ Turned off Progression item DMs for this tracker.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 async function showLinkModal(interaction) {
+  // Carries the Admin Menu message's ID through modal submit -> mode pick, so the final step
+  // can refresh that original message too (a modal reply is otherwise a separate message chain).
   const modal = new ModalBuilder()
-    .setCustomId("modal:link")
+    .setCustomId(`modal:link:${interaction.message.id}`)
     .setTitle("Link Tracker")
     .addComponents(
       new ActionRowBuilder().addComponents(
@@ -716,7 +993,8 @@ async function showLinkModal(interaction) {
 }
 
 async function handleLinkModalSubmit(interaction) {
-  const input = interaction.fields.getTextInputValue("url");
+  const originalMessageId = interaction.customId.slice("modal:link:".length);
+  const input              = interaction.fields.getTextInputValue("url");
 
   let trackerId;
   try {
@@ -740,8 +1018,8 @@ async function handleLinkModalSubmit(interaction) {
     : "";
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`menu:admin:linkmode:all:${trackerId}`).setLabel("Show All").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`menu:admin:linkmode:registered:${trackerId}`).setLabel("Registered Only").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`menu:admin:linkmode:all:${trackerId}:${originalMessageId}`).setLabel("Show All").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`menu:admin:linkmode:registered:${trackerId}:${originalMessageId}`).setLabel("Registered Only").setStyle(ButtonStyle.Primary),
   );
 
   await interaction.editReply({
@@ -750,13 +1028,15 @@ async function handleLinkModalSubmit(interaction) {
   });
 }
 
-async function handleLinkModeButton(interaction, mode, trackerId) {
-  const channel  = interaction.channel;
-  const links    = loadLinks();
-  const key      = linkKey(interaction.guildId, channel.id);
-  const isUpdate = Boolean(links[key]);
-  links[key]     = { trackerId, linkedAt: Date.now(), mode };
-  saveLinks(links);
+async function handleLinkModeButton(interaction, mode, trackerId, originalMessageId) {
+  const channel = interaction.channel;
+  const key     = linkKey(interaction.guildId, channel.id);
+
+  const { isUpdate, freshLink } = await withLinks(links => {
+    const existed  = Boolean(links[key]);
+    links[key]     = { trackerId, linkedAt: Date.now(), mode };
+    return { isUpdate: existed, freshLink: links[key] };
+  });
 
   const modeLabel  = mode === "all" ? "**Show All**" : "**Registered Only**";
   const trackerUrl = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${trackerId}`;
@@ -764,11 +1044,22 @@ async function handleLinkModeButton(interaction, mode, trackerId) {
     content: `✅ **#${channel.name}** is now ${isUpdate ? "updated to" : "linked to"} [this tracker](${trackerUrl}) in ${modeLabel} mode.`,
     components: [],
   });
+
+  // The modal/mode-pick flow is a separate message chain from the Admin Menu message that
+  // started it (a modal reply can't edit the message that opened it) — refresh that original
+  // message too so it doesn't keep showing the pre-link state if it's still on screen.
+  try {
+    const originalMessage = await channel.messages.fetch(originalMessageId);
+    await originalMessage.edit({
+      embeds: [buildMenuEmbed(freshLink, interaction.user.id, true)],
+      components: buildAdminMenuRows(freshLink),
+    });
+  } catch { /* original menu message gone or inaccessible */ }
 }
 
 async function handleUnlinkConfirm(interaction) {
   stopAutoRefresh(interaction.channelId);
-  deleteLinkEntry(interaction.guildId, interaction.channelId);
+  await deleteLinkEntry(interaction.guildId, interaction.channelId);
 
   await interaction.update({
     embeds: [buildMenuEmbed(null, interaction.user.id, hasManageChannels(interaction))],
@@ -783,11 +1074,11 @@ async function handleAdminViewMode(interaction, link, mode) {
 
   await interaction.deferUpdate();
 
-  const links     = loadLinks();
-  const key       = linkKey(interaction.guildId, interaction.channelId);
-  const freshLink = links[key];
-  freshLink.mode  = mode;
-  saveLinks(links);
+  const key = linkKey(interaction.guildId, interaction.channelId);
+  let freshLink = await withLinks(links => {
+    links[key].mode = mode;
+    return links[key];
+  });
 
   // Immediately refresh any live posted messages
   const session = activeRefreshes.get(interaction.channelId);
@@ -813,8 +1104,12 @@ async function handleAdminViewMode(interaction, link, mode) {
         session.messages.push(msg);
       }
       if (newCount !== oldCount) {
-        freshLink.messageIds = session.messages.map(m => m.id);
-        saveLinks(links);
+        const newMessageIds = session.messages.map(m => m.id);
+        freshLink = await withLinks(links => {
+          const l = links[key];
+          if (l) l.messageIds = newMessageIds;
+          return l ?? freshLink;
+        });
       }
     } catch (err) {
       console.warn("[menu:admin:viewmode] refresh failed:", err.message);
@@ -842,23 +1137,23 @@ async function handleRegisterUserSelect(interaction) {
     return interaction.reply({ content: "❌ You need **Manage Channels** permission.", flags: MessageFlags.Ephemeral });
   }
 
-  const links = loadLinks();
-  const key   = linkKey(interaction.guildId, interaction.channelId);
-  const link  = links[key];
+  const key      = linkKey(interaction.guildId, interaction.channelId);
+  const targetId = interaction.values[0];
+
+  const { link, already } = await withLinks(links => {
+    const link = links[key];
+    if (!link) return { link: null, already: false };
+    if (!link.registeredUsers) link.registeredUsers = [];
+    const already = link.registeredUsers.includes(targetId);
+    if (!already) link.registeredUsers.push(targetId);
+    return { link, already };
+  });
 
   if (!link) {
     return interaction.update({ content: "❌ This channel isn't linked to a tracker.", embeds: [], components: [] });
   }
 
-  const targetId = interaction.values[0];
-  if (!link.registeredUsers) link.registeredUsers = [];
-  const already = link.registeredUsers.includes(targetId);
-
-  if (!already) {
-    link.registeredUsers.push(targetId);
-    saveLinks(links);
-    await refreshRegisteredView(interaction, link);
-  }
+  if (!already) await refreshRegisteredView(interaction, link);
 
   await interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildAdminMenuRows(link) });
   await interaction.followUp({
@@ -876,6 +1171,8 @@ async function handleMenuButton(interaction) {
   if (id === "menu:status")     return handleMenuStatus(interaction, link);
   if (id === "menu:register")   return handleSelfRegister(interaction, link);
   if (id === "menu:unregister") return handleSelfUnregister(interaction, link);
+  if (id === "menu:dmprog:on")  return handleSelfDmProgOn(interaction, link);
+  if (id === "menu:dmprog:off") return handleSelfDmProgOff(interaction, link);
 
   // Everything below is admin-only.
   if (id.startsWith("menu:admin") && !hasManageChannels(interaction)) {
@@ -902,11 +1199,17 @@ async function handleMenuButton(interaction) {
   }
 
   if (id.startsWith("menu:admin:linkmode:")) {
-    const rest      = id.slice("menu:admin:linkmode:".length);
-    const sep       = rest.indexOf(":");
-    const mode      = rest.slice(0, sep);
-    const trackerId = rest.slice(sep + 1);
-    return handleLinkModeButton(interaction, mode, trackerId);
+    // Format: menu:admin:linkmode:<mode>:<trackerId>:<originalMessageId>. trackerId can't
+    // contain ":" (enforced by parseTrackerId), so the first colon splits off `mode` and the
+    // last colon splits off the original Admin Menu message ID.
+    const rest              = id.slice("menu:admin:linkmode:".length);
+    const firstSep          = rest.indexOf(":");
+    const mode              = rest.slice(0, firstSep);
+    const remainder         = rest.slice(firstSep + 1);
+    const lastSep           = remainder.lastIndexOf(":");
+    const trackerId         = remainder.slice(0, lastSep);
+    const originalMessageId = remainder.slice(lastSep + 1);
+    return handleLinkModeButton(interaction, mode, trackerId, originalMessageId);
   }
 }
 
@@ -925,6 +1228,7 @@ async function handleHelp(interaction) {
           "Opens the bot menu for this channel:\n" +
           "- **Status** — preview tracker status with a **Post to channel** button.\n" +
           "- **Register** / **Unregister** — add or remove yourself from the registered view (only shown once the channel's view mode is **Registered Only**).\n" +
+          "- **Enable Progression DMs** / **Disable Progression DMs** — get a DM whenever you receive a progression item in this tracker.\n" +
           "- **Admin Actions** *(Manage Channels only)* — link/unlink this channel's tracker, switch view mode between **Show All** and **Registered Only**, or register another player.",
       },
       { name: "`/help`", value: "Show this message." },
@@ -958,19 +1262,22 @@ client.once("clientReady", async () => {
   setPresence();
   setInterval(setPresence, 30 * 60 * 1000);
 
-  // Resume auto-refresh for any persisted message IDs, immediately updating each embed
-  const links  = loadLinks();
-  let modified = false;
-  let first    = true;
-  const now    = Date.now();
+  // Resume auto-refresh for any persisted message IDs, immediately updating each embed.
+  // Each removal/clear below persists immediately via its own withLinks call rather than
+  // accumulating into one big save at the end — this loop can run for minutes (deliberate
+  // 2s spacing per link plus network calls), and a single end-of-loop save would otherwise
+  // hold a stale snapshot across that whole window and clobber any menu action a user takes
+  // while the bot is still resuming.
+  const links = loadLinks();
+  let first   = true;
+  const now   = Date.now();
 
   for (const [key, link] of Object.entries(links)) {
     // Remove entries with no activity in 30+ days (skip legacy entries with no timestamps)
     const lastSeen = Math.max(link.linkedAt ?? 0, link.lastActivityAt ?? 0);
     if (lastSeen > 0 && now - lastSeen > STALE_LINK_MS) {
       console.log(`[resume] Removing stale link ${key} (last activity > 30 days ago)`);
-      delete links[key];
-      modified = true;
+      await withLinks(ls => { delete ls[key]; });
       continue;
     }
 
@@ -1018,18 +1325,17 @@ client.once("clientReady", async () => {
     } catch (err) {
       if (err.code === 10003 || err.code === 10004) {
         console.log(`[resume] Removing dead link ${key}: ${err.message}`);
-        delete links[key];
-        modified = true;
+        await withLinks(ls => { delete ls[key]; });
         continue;
       }
       console.warn(`[resume] Failed to restore ${key}:`, err.message);
     }
 
-    delete link.messageIds;
-    delete link.lastActivityAt;
-    modified = true;
+    await withLinks(ls => {
+      const l = ls[key];
+      if (l) { delete l.messageIds; delete l.lastActivityAt; }
+    });
   }
-  if (modified) saveLinks(links);
 });
 
 client.on("shardReady", () => { setPresence(); });
@@ -1047,7 +1353,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("menu:")) return await handleMenuButton(interaction);
     }
     if (interaction.isModalSubmit()) {
-      if (interaction.customId === "modal:link") return await handleLinkModalSubmit(interaction);
+      if (interaction.customId.startsWith("modal:link:")) return await handleLinkModalSubmit(interaction);
     }
     if (interaction.isUserSelectMenu()) {
       if (interaction.customId === "menu:admin:registeruser:select") return await handleRegisterUserSelect(interaction);
