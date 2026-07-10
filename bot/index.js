@@ -31,11 +31,12 @@ const LINKS_FILE    = path.join(__dirname, "links.json");
 
 // ─── Persistent Links (JSON) ──────────────────────────────────────────────────
 // Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?,
-//   lastActivityAt?, progressionDmUsers?, usefulDmUsers?, progressionItemCounts? } }
+//   lastActivityAt?, progressionDmUsers?, usefulDmUsers?, itemCounts? } }
 // progressionDmUsers / usefulDmUsers: Discord user IDs opted in to Progression / Useful item DMs
 // for this channel's tracker.
-// progressionItemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only
-// (shared baseline for both progression and useful DMs, since it just tracks total items received).
+// itemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only. Shared
+// baseline for both progression and useful DMs, since it just tracks total items received (it's
+// not "progression-only" despite the field's old name).
 
 function loadLinks() {
   if (!fs.existsSync(LINKS_FILE)) return {};
@@ -118,7 +119,7 @@ async function getItemIdToNameMap(origin, game, checksum) {
   return idToName;
 }
 
-// Diffs each opted-in user's received items against the link's progressionItemCounts and DMs
+// Diffs each opted-in user's received items against the link's itemCounts and DMs
 // them for any newly-received item flagged as progression and/or useful (per their own opt-in).
 // Looks the link up fresh (by `key`) itself, inside withLinks, right before persisting — the
 // network fetches below all happen before that lock is taken, so this never holds up other menu
@@ -161,8 +162,8 @@ async function checkNewItemDms(data, guild, key) {
     const link = links[key];
     if (!link?.progressionDmUsers?.length && !link?.usefulDmUsers?.length) return;
 
-    if (!link.progressionItemCounts) link.progressionItemCounts = {};
-    const counts = link.progressionItemCounts;
+    if (!link.itemCounts) link.itemCounts = {};
+    const counts = link.itemCounts;
 
     for (const entry of playerItemsReceived) {
       const position  = entry.player;
@@ -228,7 +229,7 @@ async function checkNewItemDms(data, guild, key) {
     const trackerUrl  = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${p.trackerId}`;
 
     const embed = new EmbedBuilder()
-      .setColor(p.kind === "useful" ? 0x6d8be8 : 0xaf99ef)
+      .setColor(p.kind === "useful" ? 0x2f6feb : 0x9b30ff)
       .setTitle(p.kind === "useful" ? "Useful Item Received" : "Progression Item Received")
       .setDescription(`**[${p.title}](${trackerUrl})**`)
       .addFields(
@@ -243,6 +244,36 @@ async function checkNewItemDms(data, guild, key) {
       console.warn(`[item-dm] Failed to DM ${p.member.id}:`, err.message);
     }
   }
+}
+
+// Establishes the { [position]: itemCount } baseline from the AP webhost's *current* item
+// counts. Called right when a channel is linked so the baseline reflects that moment, not
+// whatever the tracker looked like the first time someone happened to have DMs enabled during
+// an auto-refresh tick — otherwise anything received in between is silently treated as
+// pre-existing and never DMed. Returns null (and logs) on any fetch failure — link/relink still
+// succeeds, it just leaves the baseline to be established lazily on the next tick as before.
+async function computeItemCountBaseline(data) {
+  let apInfo;
+  try {
+    apInfo = deriveApTrackerInfo(data.upstream_url);
+  } catch (err) {
+    console.warn("[item-dm] Could not derive AP tracker info for baseline:", err.message);
+    return null;
+  }
+
+  let trackerData;
+  try {
+    trackerData = await apGet(apInfo.origin, `/api/tracker/${apInfo.apTrackerId}`);
+  } catch (err) {
+    console.warn("[item-dm] AP webhost fetch failed for baseline:", err.message);
+    return null;
+  }
+
+  const counts = {};
+  for (const entry of trackerData.player_items_received ?? []) {
+    counts[entry.player] = (entry.items ?? []).length;
+  }
+  return counts;
 }
 
 const CT_HOST = "cheesetrackers.theincrediblewheelofchee.se";
@@ -517,8 +548,10 @@ async function deleteLinkEntry(guildId, channelId) {
   });
 }
 
-// messages is an array of Discord Message objects (one per posted page)
-function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastActivityAt = Date.now(), mode = "all", registeredUserIds = []) {
+// messages is an array of Discord Message objects (one per posted page). initialData is the
+// tracker data the caller already fetched to build/refresh those pages — reused here to run the
+// first DM check immediately instead of waiting up to REFRESH_INTERVAL_MS for the first tick.
+function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, initialLastActivityAt = Date.now(), mode = "all", registeredUserIds = []) {
   const channelId = messages[0].channelId;
   const key       = linkKey(guild.id, channelId);
   stopAutoRefresh(channelId);
@@ -533,6 +566,8 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
     registeredUserIds: [...registeredUserIds],
     intervalId:        null,
   };
+
+  checkNewItemDms(initialData, guild, key);
 
   session.intervalId = setInterval(async () => {
     try {
@@ -549,7 +584,7 @@ function startAutoRefresh(messages, trackerId, guild, initialHash, initialLastAc
         });
       }
 
-      // Fetches its own data and persists progressionItemCounts internally (via withLinks), so
+      // Fetches its own data and persists itemCounts internally (via withLinks), so
       // this tick never has to hold a stale in-memory links snapshot across these awaits.
       await checkNewItemDms(data, guild, key);
 
@@ -846,7 +881,7 @@ async function handlePostButton(interaction) {
     messages.push(await interaction.channel.send({ embeds: [page] }));
   }
   const now = Date.now();
-  startAutoRefresh(messages, trackerId, interaction.guild, hashTrackerData(data), now, mode, registeredUsers);
+  startAutoRefresh(messages, trackerId, interaction.guild, data, hashTrackerData(data), now, mode, registeredUsers);
 
   const messageIds = messages.map(m => m.id);
   await withLinks(freshLinks => {
@@ -1064,10 +1099,8 @@ async function handleSelfDmUsefulOff(interaction, link) {
 }
 
 async function showLinkModal(interaction) {
-  // Carries the Admin Menu message's ID through modal submit -> mode pick, so the final step
-  // can refresh that original message too (a modal reply is otherwise a separate message chain).
   const modal = new ModalBuilder()
-    .setCustomId(`modal:link:${interaction.message.id}`)
+    .setCustomId("modal:link")
     .setTitle("Link Tracker")
     .addComponents(
       new ActionRowBuilder().addComponents(
@@ -1083,8 +1116,7 @@ async function showLinkModal(interaction) {
 }
 
 async function handleLinkModalSubmit(interaction) {
-  const originalMessageId = interaction.customId.slice("modal:link:".length);
-  const input              = interaction.fields.getTextInputValue("url");
+  const input = interaction.fields.getTextInputValue("url");
 
   let trackerId;
   try {
@@ -1093,13 +1125,16 @@ async function handleLinkModalSubmit(interaction) {
     return interaction.reply({ content: `❌ Invalid URL: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  // The modal was opened from the Admin Menu button, so this submission can edit that same
+  // (possibly ephemeral) message directly via deferUpdate/editReply — no need to smuggle its
+  // ID around and refetch it later, which doesn't work for ephemeral messages anyway.
+  await interaction.deferUpdate();
 
   let data;
   try {
     data = await ctGet(`/tracker/${trackerId}`);
   } catch (err) {
-    return interaction.editReply(`❌ Could not reach that tracker: ${err.message}`);
+    return interaction.followUp({ content: `❌ Could not reach that tracker: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
   const playerCount = new Set((data?.games ?? []).map(g => g.effective_discord_username).filter(Boolean)).size;
@@ -1108,17 +1143,18 @@ async function handleLinkModalSubmit(interaction) {
     : "";
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`menu:admin:linkmode:all:${trackerId}:${originalMessageId}`).setLabel("Show All").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`menu:admin:linkmode:registered:${trackerId}:${originalMessageId}`).setLabel("Registered Only").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`menu:admin:linkmode:all:${trackerId}`).setLabel("Show All").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`menu:admin:linkmode:registered:${trackerId}`).setLabel("Registered Only").setStyle(ButtonStyle.Primary),
   );
 
   await interaction.editReply({
     content: `Found tracker \`${trackerId}\` — **${playerCount}** players.\nPick a view mode to finish linking:${warning}`,
+    embeds: [],
     components: [row],
   });
 }
 
-async function handleLinkModeButton(interaction, mode, trackerId, originalMessageId) {
+async function handleLinkModeButton(interaction, mode, trackerId) {
   const channel = interaction.channel;
   const key     = linkKey(interaction.guildId, channel.id);
 
@@ -1128,23 +1164,29 @@ async function handleLinkModeButton(interaction, mode, trackerId, originalMessag
     return { isUpdate: existed, freshLink: links[key] };
   });
 
-  const modeLabel  = mode === "all" ? "**Show All**" : "**Registered Only**";
-  const trackerUrl = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${trackerId}`;
   await interaction.update({
-    content: `✅ **#${channel.name}** is now ${isUpdate ? "updated to" : "linked to"} [this tracker](${trackerUrl}) in ${modeLabel} mode.`,
-    components: [],
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, true)],
+    components: buildAdminMenuRows(freshLink),
   });
 
-  // The modal/mode-pick flow is a separate message chain from the Admin Menu message that
-  // started it (a modal reply can't edit the message that opened it) — refresh that original
-  // message too so it doesn't keep showing the pre-link state if it's still on screen.
+  const modeLabel  = mode === "all" ? "**Show All**" : "**Registered Only**";
+  const trackerUrl = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${trackerId}`;
+  await interaction.followUp({
+    content: `✅ **#${channel.name}** is now ${isUpdate ? "updated to" : "linked to"} [this tracker](${trackerUrl}) in ${modeLabel} mode.`,
+    flags: MessageFlags.Ephemeral,
+  });
+
   try {
-    const originalMessage = await channel.messages.fetch(originalMessageId);
-    await originalMessage.edit({
-      embeds: [buildMenuEmbed(freshLink, interaction.user.id, true)],
-      components: buildAdminMenuRows(freshLink),
-    });
-  } catch { /* original menu message gone or inaccessible */ }
+    const data     = await ctGet(`/tracker/${trackerId}`);
+    const baseline = await computeItemCountBaseline(data);
+    if (baseline) {
+      await withLinks(links => {
+        if (links[key]) links[key].itemCounts = baseline;
+      });
+    }
+  } catch (err) {
+    console.warn("[item-dm] Failed to establish item-count baseline at link time:", err.message);
+  }
 }
 
 async function handleUnlinkConfirm(interaction) {
@@ -1295,17 +1337,13 @@ async function handleMenuButton(interaction) {
   }
 
   if (id.startsWith("menu:admin:linkmode:")) {
-    // Format: menu:admin:linkmode:<mode>:<trackerId>:<originalMessageId>. trackerId can't
-    // contain ":" (enforced by parseTrackerId), so the first colon splits off `mode` and the
-    // last colon splits off the original Admin Menu message ID.
-    const rest              = id.slice("menu:admin:linkmode:".length);
-    const firstSep          = rest.indexOf(":");
-    const mode              = rest.slice(0, firstSep);
-    const remainder         = rest.slice(firstSep + 1);
-    const lastSep           = remainder.lastIndexOf(":");
-    const trackerId         = remainder.slice(0, lastSep);
-    const originalMessageId = remainder.slice(lastSep + 1);
-    return handleLinkModeButton(interaction, mode, trackerId, originalMessageId);
+    // Format: menu:admin:linkmode:<mode>:<trackerId>. trackerId can't contain ":"
+    // (enforced by parseTrackerId), so the first colon is enough to split off `mode`.
+    const rest      = id.slice("menu:admin:linkmode:".length);
+    const firstSep  = rest.indexOf(":");
+    const mode      = rest.slice(0, firstSep);
+    const trackerId = rest.slice(firstSep + 1);
+    return handleLinkModeButton(interaction, mode, trackerId);
   }
 }
 
@@ -1413,7 +1451,7 @@ client.once("clientReady", async () => {
             try { await messages[i].edit({ embeds: [pages[i]], components: [] }); }
             catch { /* message gone */ }
           }
-          startAutoRefresh(messages, link.trackerId, guild, hashTrackerData(data), link.lastActivityAt, mode, registeredUsers);
+          startAutoRefresh(messages, link.trackerId, guild, data, hashTrackerData(data), link.lastActivityAt, mode, registeredUsers);
           console.log(`[resume] Restored and updated auto-refresh for ${key}`);
           continue;
         }
@@ -1449,7 +1487,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("menu:")) return await handleMenuButton(interaction);
     }
     if (interaction.isModalSubmit()) {
-      if (interaction.customId.startsWith("modal:link:")) return await handleLinkModalSubmit(interaction);
+      if (interaction.customId === "modal:link") return await handleLinkModalSubmit(interaction);
     }
     if (interaction.isUserSelectMenu()) {
       if (interaction.customId === "menu:admin:registeruser:select") return await handleRegisterUserSelect(interaction);
