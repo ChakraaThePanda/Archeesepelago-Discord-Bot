@@ -30,7 +30,7 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 | Command | Who can use | Description |
 |---|---|---|
-| `/menu` | Everyone | Opens an ephemeral (visible only to you) button menu for the current channel. |
+| `/menu` | Everyone | Shows the menu for the current channel. |
 | `/help` | Everyone | Shows bot info and a link to this GitHub page. |
 
 ### `/menu` layout
