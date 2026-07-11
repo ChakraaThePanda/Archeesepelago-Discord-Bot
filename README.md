@@ -18,9 +18,9 @@ Log in at CheeseTrackers → click your profile → copy your API key.
 Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/run.bat`.
 
 `run.bat` handles everything automatically on first run:
-- **Node.js** — installs it via winget if not found, with a PowerShell download as fallback. A UAC prompt may appear during installation.
-- **Dependencies** — runs `npm install` automatically.
-- **Config** — opens `archeesepelago.conf` in Notepad for you if it hasn't been filled in yet.
+- **Node.js**: installs it via winget if not found, with a PowerShell download as fallback. A UAC prompt may appear during installation.
+- **Dependencies**: runs `npm install` automatically.
+- **Config**: opens `archeesepelago.conf` in Notepad for you if it hasn't been filled in yet.
 
 > **If Node.js fails to install automatically**, install it manually from [nodejs.org](https://nodejs.org/), then double-click `run.bat` again.
 
@@ -35,22 +35,22 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 ### `/menu` layout
 
-- **Status** *(Everyone)* — shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
-- **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)* — adds/removes you from the channel's **Registered Only** view.
-- **DM Notifications** *(Everyone)* — opens a submenu with two independent toggles:
-  - **Enable/Disable Progression DMs** — opts you in/out of a DM whenever you receive a progression item in this tracker's room.
-  - **Enable/Disable Useful DMs** — opts you in/out of a DM whenever you receive a useful item in this tracker's room.
+- **Status** *(Everyone)*: shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
+- **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)*: adds/removes you from the channel's **Registered Only** view.
+- **DM Notifications** *(Everyone)*: opens a submenu with two independent toggles:
+  - **Enable/Disable Progression DMs**: opts you in/out of a DM whenever you receive a progression item in this tracker's room.
+  - **Enable/Disable Useful DMs**: opts you in/out of a DM whenever you receive a useful item in this tracker's room.
 
   Both are detected directly from the Archipelago room's own item data (via the tracker's linked Archipelago webhost), not just hinted items. Items you find yourself (including in any other game you claim in the same room) don't trigger a DM, only items sent to you from someone else's world do.
-- **Admin Actions** *(Manage Channels)* — opens a submenu:
-  - **Link Tracker** / **Update Tracker** — opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
-  - **Unlink Channel** — removes the channel's link (with a confirmation step) and stops auto-refresh.
-  - **View Mode: Show All** / **View Mode: Registered Only** — switches the channel's view mode, updating any live posted messages immediately.
-  - **Register Someone** — picks another member (via Discord's user select menu) to add to the **Registered Only** view.
+- **Admin Actions** *(Manage Channels)*: opens a submenu:
+  - **Link Tracker** / **Update Tracker**: opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
+  - **Unlink Channel**: removes the channel's link (with a confirmation step) and stops auto-refresh.
+  - **View Mode: Show All** / **View Mode: Registered Only**: switches the channel's view mode, updating any live posted messages immediately.
+  - **Register Someone**: picks another member (via Discord's user select menu) to add to the **Registered Only** view.
 
 ### View modes
-- **Show All** — every player's games are shown, including unclaimed slots. Best for small rooms.
-- **Registered Only** — only players who've run `/register` are shown. Recommended for big rooms (20+ players) to avoid flooding the channel with huge, frequently-updating posts.
+- **Show All**: every player's games are shown, including unclaimed slots. Best for small rooms.
+- **Registered Only**: only players who've run `/register` are shown. Recommended for big rooms (20+ players) to avoid flooding the channel with huge, frequently-updating posts.
 
 ---
 
@@ -59,7 +59,7 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 Slots are sorted alphabetically and grouped by owner. Owners appear as Discord `@mentions` if their CT username matches a server member.
 
 ```
-🚀🏁 `SlotName` — Game Name — 42/80 (53%)
+🚀🏁 `SlotName` - Game Name - 42/80 (53%)
 ```
 
 | Completion | | Progression | |
@@ -82,6 +82,6 @@ Once posted via **Post to channel**, a status post updates itself automatically:
 ---
 
 ## Notes
-- Links are saved in `bot/links.json` — one entry per guild+channel pair, along with view mode, registered users, and live message IDs
+- Links are saved in `bot/links.json`, one entry per guild+channel pair, along with view mode, registered users, and live message IDs
 - Links with no activity for 30+ days are automatically cleaned up on bot startup
 - Slash commands register globally on startup; Discord may take up to an hour to propagate changes to all servers
