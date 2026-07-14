@@ -37,11 +37,9 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 - **Status** *(Everyone)*: shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
 - **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)*: adds/removes you from the channel's **Registered Only** view.
-- **DM Notifications** *(Everyone)*: opens a submenu with two independent toggles:
-  - **Enable/Disable Progression DMs**: opts you in/out of a DM whenever you receive a progression item in this tracker's room.
-  - **Enable/Disable Useful DMs**: opts you in/out of a DM whenever you receive a useful item in this tracker's room.
+- **DM Notifications** *(Everyone)*: opens a submenu with a dropdown per item kind — **Progression** and **Useful** — plus an **Enable All / Disable All** button. The dropdown's label shows how many games are currently on; picking a game toggles it (its description shows its current state) rather than replacing the whole list, so the closed dropdown stays a compact count instead of listing every selected game. While **Enable All** is on, the dropdown is disabled (everything's already covered, including games added to the room later) — hit **Disable All** to pick individually. Rosters over 25 games page across multiple dropdowns.
 
-  Both are detected directly from the Archipelago room's own item data (via the tracker's linked Archipelago webhost), not just hinted items. Items you find yourself (including in any other game you claim in the same room) don't trigger a DM, only items sent to you from someone else's world do.
+  Both kinds are detected directly from the Archipelago room's own item data (via the tracker's linked Archipelago webhost), not just hinted items. Items you find yourself (including in any other game you claim in the same room) don't trigger a DM, only items sent to you from someone else's world do.
 - **Admin Actions** *(Manage Channels)*: opens a submenu:
   - **Link Tracker** / **Update Tracker**: opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
   - **Unlink Channel**: removes the channel's link (with a confirmation step) and stops auto-refresh.

@@ -15,6 +15,8 @@ const {
   TextInputBuilder,
   TextInputStyle,
   UserSelectMenuBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   PermissionFlagsBits,
   ActivityType,
   MessageFlags,
@@ -31,9 +33,11 @@ const LINKS_FILE    = path.join(__dirname, "links.json");
 
 // ─── Persistent Links (JSON) ──────────────────────────────────────────────────
 // Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?,
-//   lastActivityAt?, progressionDmUsers?, usefulDmUsers?, itemCounts? } }
-// progressionDmUsers / usefulDmUsers: Discord user IDs opted in to Progression / Useful item DMs
-// for this channel's tracker.
+//   lastActivityAt?, dmSlotSettings?, itemCounts? } }
+// dmSlotSettings: { [discordUserId]: { progression?: "all" | apPlayerPosition[], useful?: "all" | apPlayerPosition[] } }
+// — per-user, per-slot opt-in to Progression / Useful item DMs for this channel's tracker. "all"
+// means every slot the user owns, including ones added to the room later; an array is an explicit
+// subset of AP player positions. A kind absent from a user's entry means DMs are off for it.
 // itemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only. Shared
 // baseline for both progression and useful DMs, since it just tracks total items received (it's
 // not "progression-only" despite the field's old name).
@@ -76,8 +80,39 @@ function ctHeaders() {
   return h;
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Every ctGet call fetches the same handful of tracker IDs — a DM-menu session alone can fire
+// one per click (open, each toggle, each page, Enable/Disable All). This cache absorbs a burst
+// of clicks on the same tracker within a few seconds without ever going stale for anything that
+// actually cares about freshness (background refresh polls every 5 minutes).
+const CT_CACHE_TTL_MS = 4000;
+const ctCache = new Map(); // endpoint -> { data, fetchedAt }
+
 async function ctGet(endpoint) {
+  const cached = ctCache.get(endpoint);
+  if (cached && Date.now() - cached.fetchedAt < CT_CACHE_TTL_MS) return cached.data;
+
+  const data = await ctGetFresh(endpoint);
+  ctCache.set(endpoint, { data, fetchedAt: Date.now() });
+  return data;
+}
+
+// Retries a 429 a few times with backoff (honoring Retry-After when CheeseTrackers sends one)
+// so a transient rate limit resolves itself within the same click instead of surfacing an error
+// the user has to retry by clicking again. Any other failure still throws immediately, same as
+// before — this only smooths over the one failure mode that's directly tied to click volume.
+async function ctGetFresh(endpoint, attempt = 0) {
   const res = await fetch(`${BASE_URL}${endpoint}`, { headers: ctHeaders() });
+
+  if (res.status === 429 && attempt < 3) {
+    const retryAfterMs = Number(res.headers.get("retry-after")) * 1000 || 500 * 2 ** attempt;
+    await sleep(retryAfterMs);
+    return ctGetFresh(endpoint, attempt + 1);
+  }
+
   if (!res.ok) throw new Error(`CheeseTrackers API returned ${res.status}`);
   return res.json();
 }
@@ -127,7 +162,7 @@ async function getItemIdToNameMap(origin, game, checksum) {
 // as "no update".
 async function checkNewItemDms(data, guild, key) {
   const peek = loadLinks()[key];
-  if (!peek?.progressionDmUsers?.length && !peek?.usefulDmUsers?.length) return;
+  if (!peek?.dmSlotSettings || !Object.keys(peek.dmSlotSettings).length) return;
 
   let apInfo;
   try {
@@ -160,7 +195,7 @@ async function checkNewItemDms(data, guild, key) {
 
   await withLinks(links => {
     const link = links[key];
-    if (!link?.progressionDmUsers?.length && !link?.usefulDmUsers?.length) return;
+    if (!link?.dmSlotSettings || !Object.keys(link.dmSlotSettings).length) return;
 
     if (!link.itemCounts) link.itemCounts = {};
     const counts = link.itemCounts;
@@ -184,8 +219,10 @@ async function checkNewItemDms(data, guild, key) {
       if (!game?.effective_discord_username) continue;
       const member = memberByUsername.get(game.effective_discord_username.toLowerCase());
       if (!member) continue;
-      const wantsProgression = link.progressionDmUsers?.includes(member.id);
-      const wantsUseful      = link.usefulDmUsers?.includes(member.id);
+      const dmSetting        = link.dmSlotSettings[member.id];
+      if (!dmSetting) continue;
+      const wantsProgression = isSlotSelected(dmSetting.progression, position);
+      const wantsUseful      = isSlotSelected(dmSetting.useful, position);
       if (!wantsProgression && !wantsUseful) continue;
 
       const checksum = staticData?.datapackage?.[game.game]?.checksum;
@@ -345,6 +382,28 @@ async function buildMemberByUsernameMap(guild) {
   return memberByUsername;
 }
 
+// A dmSlotSettings value for one kind (progression/useful): "all" every owned slot including
+// future ones, an array of specific AP player positions, or undefined/missing (off).
+function isSlotSelected(setting, position) {
+  return setting === "all" || (Array.isArray(setting) && setting.includes(position));
+}
+
+// Games in this tracker owned by `userId`, matched the same way checkNewItemDms resolves a slot's
+// Discord owner (case-insensitive username/global name/nickname). Every call site needs both the
+// full game objects (to render) and the bare positions (to cross-reference stored settings), so
+// this returns both from the one fetch rather than making callers re-derive positions themselves.
+async function getOwnedGames(guild, data, userId) {
+  const memberByUsername = await buildMemberByUsernameMap(guild);
+  const owned = [];
+  for (const g of data.games ?? []) {
+    if (!g.effective_discord_username) continue;
+    const member = memberByUsername.get(g.effective_discord_username.toLowerCase());
+    if (member?.id === userId) owned.push(g);
+  }
+  owned.sort((a, b) => a.game.localeCompare(b.game) || a.name.localeCompare(b.name));
+  return { ownedGames: owned, ownedPositions: owned.map(g => g.position) };
+}
+
 function progressBar(done, total) {
   if (!total) return "0/0 (0%)";
   const rawPct = Math.round((done / total) * 100);
@@ -391,7 +450,29 @@ function hasManageChannels(interaction) {
   return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels));
 }
 
-function buildMenuEmbed(link, userId, isManager) {
+// The "no link" guard repeats identically across most handlers — reply vs update depends only on
+// whether the interaction has already been acknowledged by an earlier update/component render.
+function notLinkedReply(interaction) {
+  return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+}
+
+function notLinkedUpdate(interaction) {
+  return interaction.update({ content: "❌ This channel isn't linked to a tracker.", embeds: [], components: [] });
+}
+
+// `ownedPositions`, when given, cross-references the stored setting against games the user
+// currently owns — a stored array can otherwise still list positions from games unclaimed since
+// (links.json never prunes those on its own), which would overcount. Omitted at call sites that
+// don't have fresh tracker data on hand; those fall back to the raw (possibly stale) length.
+function dmSettingSummary(setting, ownedPositions = null) {
+  if (setting === "all") return "✅ **On** (all games)";
+  if (!Array.isArray(setting) || !setting.length) return "❌ **Off**";
+  const count = ownedPositions ? setting.filter(p => ownedPositions.includes(p)).length : setting.length;
+  if (!count) return "❌ **Off**";
+  return `✅ **On** (${count} game${count === 1 ? "" : "s"})`;
+}
+
+function buildMenuEmbed(link, userId, isManager, ownedPositions = null) {
   const e = new EmbedBuilder().setColor(0xf5c542).setTitle("Archeesepelago Menu");
   if (!link) {
     e.setDescription(
@@ -412,10 +493,8 @@ function buildMenuEmbed(link, userId, isManager) {
     lines.push(isRegistered ? "You are: ✅ **Registered**" : "You are: ❌ **Not registered**");
   }
 
-  const dmOnProgression = (link.progressionDmUsers ?? []).includes(userId);
-  const dmOnUseful      = (link.usefulDmUsers ?? []).includes(userId);
-  lines.push(`Progression item DMs: ${dmOnProgression ? "✅ **On**" : "❌ **Off**"}`);
-  lines.push(`Useful item DMs: ${dmOnUseful ? "✅ **On**" : "❌ **Off**"}`);
+  lines.push(`Progression item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.progression, ownedPositions)}`);
+  lines.push(`Useful item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.useful, ownedPositions)}`);
 
   e.setDescription(lines.join("\n"));
   return e;
@@ -458,24 +537,87 @@ function buildMainMenuRows(interaction, link) {
   return rows;
 }
 
-function buildDmMenuRows(link, userId) {
-  const dmOnProgression = (link.progressionDmUsers ?? []).includes(userId);
-  const dmOnUseful      = (link.usefulDmUsers ?? []).includes(userId);
-  return [
-    new ActionRowBuilder().addComponents(
-      dmOnProgression
-        ? new ButtonBuilder().setCustomId("menu:dmprog:off").setLabel("Disable Progression DMs").setStyle(ButtonStyle.Danger)
-        : new ButtonBuilder().setCustomId("menu:dmprog:on").setLabel("Enable Progression DMs").setStyle(ButtonStyle.Success)
-    ),
-    new ActionRowBuilder().addComponents(
-      dmOnUseful
-        ? new ButtonBuilder().setCustomId("menu:dmuseful:off").setLabel("Disable Useful DMs").setStyle(ButtonStyle.Danger)
-        : new ButtonBuilder().setCustomId("menu:dmuseful:on").setLabel("Enable Useful DMs").setStyle(ButtonStyle.Success)
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("menu:back").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
-    ),
+const DM_SLOTS_PER_PAGE = 25; // Discord's per-select option cap
+
+// "Enable/Disable All" is a dedicated button, not a select option — mixing it into the select
+// meant unchecking it while individual games still showed checked (inherited from "all") got
+// silently overridden back to "all". A separate button has no such ambiguity: it's either "all"
+// (select disabled — nothing to conflict with) or a plain per-game pick list.
+//
+// The select never marks options as default/selected — Discord renders a closed multi-select's
+// default-selected options as inline chips in place of the placeholder, which is exactly the
+// "every game listed one by one" clutter this avoids. Instead the placeholder itself carries a
+// live count, and each option's description (not its checked state) shows current on/off — so
+// picking an option here toggles that one game rather than replacing the page's whole selection.
+function buildDmSlotRows(kind, ownedGames, setting, page) {
+  const isAll       = setting === "all";
+  const totalPages  = Math.max(1, Math.ceil(ownedGames.length / DM_SLOTS_PER_PAGE));
+  const clampedPage = Math.max(0, Math.min(page, totalPages - 1));
+  const pageGames   = ownedGames.slice(clampedPage * DM_SLOTS_PER_PAGE, (clampedPage + 1) * DM_SLOTS_PER_PAGE);
+  const label       = kind === "progression" ? "Progression" : "Useful";
+  const pageSuffix  = totalPages > 1 ? ` — page ${clampedPage + 1}/${totalPages}` : "";
+  // Counts only positions still among ownedGames — a stored array can otherwise still list a
+  // position from a game unclaimed since (nothing prunes links.json on unclaim), overcounting.
+  const ownedPositions = ownedGames.map(g => g.position);
+  const onCount        = Array.isArray(setting) ? setting.filter(p => ownedPositions.includes(p)).length : 0;
+  const placeholder = isAll
+    ? `All ${label} enabled`
+    : `${onCount === 0 ? "❌" : "✅"} ${onCount} of ${ownedGames.length} ${label} enabled${pageSuffix}`;
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`menu:dmslot:${kind}:${clampedPage}`)
+    .setPlaceholder(placeholder)
+    .setDisabled(isAll)
+    .setMinValues(0)
+    .setMaxValues(pageGames.length)
+    .addOptions(
+      pageGames.map(g =>
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`${g.game} (${g.name})`.slice(0, 100))
+          .setDescription(isSlotSelected(setting, g.position) ? "✅ On — pick to turn off" : "❌ Off — pick to turn on")
+          .setValue(String(g.position))
+      )
+    );
+
+  const controls = [
+    isAll
+      ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
+      : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
   ];
+  if (totalPages > 1) {
+    controls.push(
+      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:p:${clampedPage}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
+      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:n:${clampedPage}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
+    );
+  }
+
+  return [
+    new ActionRowBuilder().addComponents(select),
+    new ActionRowBuilder().addComponents(...controls),
+  ];
+}
+
+// Takes ownedGames rather than fetching it, so callers can reuse the same fetch for the embed's
+// accurate DM-count lines (see dmSettingSummary) instead of resolving guild membership twice.
+// `pages` optionally pins the current page per kind (e.g. { progression: 1 }) so paging one
+// select doesn't bounce the other back to page 0 when the menu re-renders.
+function buildDmMenuRows(link, userId, ownedGames, pages = {}) {
+  if (!ownedGames.length) {
+    return [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("menu:dm:noop").setLabel("You have no games in this tracker").setStyle(ButtonStyle.Secondary).setDisabled(true)
+      ),
+      backToMenuRow(),
+    ];
+  }
+
+  const settings = link.dmSlotSettings?.[userId] ?? {};
+  const rows = [
+    ...buildDmSlotRows("progression", ownedGames, settings.progression, pages.progression ?? 0),
+    ...buildDmSlotRows("useful", ownedGames, settings.useful, pages.useful ?? 0),
+    backToMenuRow(),
+  ];
+  return rows;
 }
 
 function buildAdminMenuRows(link) {
@@ -572,7 +714,7 @@ function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, 
     intervalId:        null,
   };
 
-  checkNewItemDms(initialData, guild, key);
+  checkNewItemDms(initialData, guild, key).catch(err => console.error("[item-dm] unexpected failure:", err));
 
   session.intervalId = setInterval(async () => {
     try {
@@ -920,9 +1062,7 @@ async function refreshRegisteredView(interaction, link) {
 }
 
 async function handleSelfRegister(interaction, link) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
-  }
+  if (!link) return notLinkedReply(interaction);
 
   const userId = interaction.user.id;
   const key    = linkKey(interaction.guildId, interaction.channelId);
@@ -939,9 +1079,12 @@ async function handleSelfRegister(interaction, link) {
     return interaction.reply({ content: "✅ You're already registered in this channel's tracker view.", flags: MessageFlags.Ephemeral });
   }
 
+  // Ack before refreshRegisteredView's tracker fetch + message edits — those can easily run
+  // past Discord's 3-second reply window, which is what was causing "This interaction failed".
+  await interaction.deferUpdate();
   await refreshRegisteredView(interaction, freshLink);
 
-  await interaction.update({
+  await interaction.editReply({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
     components: buildMainMenuRows(interaction, freshLink),
   });
@@ -952,9 +1095,7 @@ async function handleSelfRegister(interaction, link) {
 }
 
 async function handleSelfUnregister(interaction, link) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
-  }
+  if (!link) return notLinkedReply(interaction);
 
   const userId = interaction.user.id;
   const key    = linkKey(interaction.guildId, interaction.channelId);
@@ -971,9 +1112,10 @@ async function handleSelfUnregister(interaction, link) {
     return interaction.reply({ content: "❌ You're not registered in this channel's tracker view.", flags: MessageFlags.Ephemeral });
   }
 
+  await interaction.deferUpdate();
   await refreshRegisteredView(interaction, freshLink);
 
-  await interaction.update({
+  await interaction.editReply({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
     components: buildMainMenuRows(interaction, freshLink),
   });
@@ -983,123 +1125,138 @@ async function handleSelfUnregister(interaction, link) {
   });
 }
 
-async function handleSelfDmProgOn(interaction, link) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+async function handleDmMenu(interaction, link) {
+  if (!link) return notLinkedReply(interaction);
+
+  await interaction.deferUpdate();
+  await interaction.editReply({ content: "Loading DM settings...", embeds: [], components: [] });
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${link.trackerId}`);
+  } catch (err) {
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  const userId = interaction.user.id;
-  const key    = linkKey(interaction.guildId, interaction.channelId);
+  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
 
-  const { alreadyOn, freshLink } = await withLinks(links => {
-    const freshLink = links[key];
-    if (!freshLink.progressionDmUsers) freshLink.progressionDmUsers = [];
-    if (freshLink.progressionDmUsers.includes(userId)) return { alreadyOn: true, freshLink };
-    freshLink.progressionDmUsers.push(userId);
-    return { alreadyOn: false, freshLink };
-  });
-
-  if (alreadyOn) {
-    return interaction.reply({ content: "✅ You're already getting Progression item DMs for this tracker.", flags: MessageFlags.Ephemeral });
-  }
-
-  await interaction.update({
-    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
-    components: buildDmMenuRows(freshLink, interaction.user.id),
-  });
-  await interaction.followUp({
-    content: "✅ You'll get a DM whenever you receive a progression item in this tracker.",
-    flags: MessageFlags.Ephemeral,
+  await interaction.editReply({
+    content: null,
+    embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
+    components: buildDmMenuRows(link, interaction.user.id, ownedGames),
   });
 }
 
-async function handleSelfDmProgOff(interaction, link) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+// Per-game toggles from a StringSelectMenu — only ever reachable when the kind isn't currently
+// "all" (the select is disabled otherwise). The select doesn't track "checked" state (see
+// buildDmSlotRows), so each submitted value is a flip: on->off or off->on. Games not picked are
+// left exactly as they were, on any page.
+async function handleDmSlotSelect(interaction) {
+  const [, , kind, pageStr] = interaction.customId.split(":");
+  const page = parseInt(pageStr, 10);
+  const key  = linkKey(interaction.guildId, interaction.channelId);
+  const link = loadLinks()[key];
+
+  if (!link) return notLinkedUpdate(interaction);
+
+  await interaction.deferUpdate();
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${link.trackerId}`);
+  } catch (err) {
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  const userId = interaction.user.id;
-  const key    = linkKey(interaction.guildId, interaction.channelId);
+  const toggledPositions = interaction.values.map(Number);
 
-  const { wasOn, freshLink } = await withLinks(links => {
-    const freshLink = links[key];
-    const idx       = (freshLink.progressionDmUsers ?? []).indexOf(userId);
-    if (idx === -1) return { wasOn: false, freshLink };
-    freshLink.progressionDmUsers.splice(idx, 1);
-    return { wasOn: true, freshLink };
+  const freshLink = await withLinks(freshLinks => {
+    const l = freshLinks[key];
+    l.dmSlotSettings ??= {};
+    l.dmSlotSettings[interaction.user.id] ??= {};
+    const prevSetting = l.dmSlotSettings[interaction.user.id][kind];
+    const resolved     = new Set(Array.isArray(prevSetting) ? prevSetting : []);
+
+    for (const pos of toggledPositions) {
+      if (resolved.has(pos)) resolved.delete(pos);
+      else resolved.add(pos);
+    }
+
+    l.dmSlotSettings[interaction.user.id][kind] = [...resolved];
+    return l;
   });
 
-  if (!wasOn) {
-    return interaction.reply({ content: "❌ You're not currently getting Progression item DMs for this tracker.", flags: MessageFlags.Ephemeral });
-  }
+  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
 
-  await interaction.update({
-    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
-    components: buildDmMenuRows(freshLink, interaction.user.id),
-  });
-  await interaction.followUp({
-    content: "✅ Turned off Progression item DMs for this tracker.",
-    flags: MessageFlags.Ephemeral,
+  await interaction.editReply({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
+    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, {
+      progression: kind === "progression" ? page : 0,
+      useful:      kind === "useful" ? page : 0,
+    }),
   });
 }
 
-async function handleSelfDmUsefulOn(interaction, link) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+// Dedicated Enable All / Disable All button — a single unconditional action, so there's no
+// ambiguity with whatever the per-game select happens to show.
+async function handleDmSlotAllToggle(interaction) {
+  const [, , kind, action] = interaction.customId.split(":");
+  const key  = linkKey(interaction.guildId, interaction.channelId);
+  const link = loadLinks()[key];
+
+  if (!link) return notLinkedUpdate(interaction);
+
+  await interaction.deferUpdate();
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${link.trackerId}`);
+  } catch (err) {
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  const userId = interaction.user.id;
-  const key    = linkKey(interaction.guildId, interaction.channelId);
-
-  const { alreadyOn, freshLink } = await withLinks(links => {
-    const freshLink = links[key];
-    if (!freshLink.usefulDmUsers) freshLink.usefulDmUsers = [];
-    if (freshLink.usefulDmUsers.includes(userId)) return { alreadyOn: true, freshLink };
-    freshLink.usefulDmUsers.push(userId);
-    return { alreadyOn: false, freshLink };
+  const freshLink = await withLinks(freshLinks => {
+    const l = freshLinks[key];
+    l.dmSlotSettings ??= {};
+    l.dmSlotSettings[interaction.user.id] ??= {};
+    l.dmSlotSettings[interaction.user.id][kind] = action === "on" ? "all" : [];
+    return l;
   });
 
-  if (alreadyOn) {
-    return interaction.reply({ content: "✅ You're already getting Useful item DMs for this tracker.", flags: MessageFlags.Ephemeral });
-  }
+  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
 
-  await interaction.update({
-    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
-    components: buildDmMenuRows(freshLink, interaction.user.id),
-  });
-  await interaction.followUp({
-    content: "✅ You'll get a DM whenever you receive a useful item in this tracker.",
-    flags: MessageFlags.Ephemeral,
+  await interaction.editReply({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
+    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames),
   });
 }
 
-async function handleSelfDmUsefulOff(interaction, link) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
+async function handleDmSlotPageButton(interaction) {
+  const [, , kind, dir, pageStr] = interaction.customId.split(":");
+  const fromPage = parseInt(pageStr, 10);
+  const key      = linkKey(interaction.guildId, interaction.channelId);
+  const link     = loadLinks()[key];
+
+  if (!link) return notLinkedUpdate(interaction);
+
+  await interaction.deferUpdate();
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${link.trackerId}`);
+  } catch (err) {
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  const userId = interaction.user.id;
-  const key    = linkKey(interaction.guildId, interaction.channelId);
+  const newPage       = dir === "n" ? fromPage + 1 : fromPage - 1;
+  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
 
-  const { wasOn, freshLink } = await withLinks(links => {
-    const freshLink = links[key];
-    const idx       = (freshLink.usefulDmUsers ?? []).indexOf(userId);
-    if (idx === -1) return { wasOn: false, freshLink };
-    freshLink.usefulDmUsers.splice(idx, 1);
-    return { wasOn: true, freshLink };
-  });
-
-  if (!wasOn) {
-    return interaction.reply({ content: "❌ You're not currently getting Useful item DMs for this tracker.", flags: MessageFlags.Ephemeral });
-  }
-
-  await interaction.update({
-    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction))],
-    components: buildDmMenuRows(freshLink, interaction.user.id),
-  });
-  await interaction.followUp({
-    content: "✅ Turned off Useful item DMs for this tracker.",
-    flags: MessageFlags.Ephemeral,
+  await interaction.editReply({
+    embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
+    components: buildDmMenuRows(link, interaction.user.id, ownedGames, {
+      progression: kind === "progression" ? newPage : 0,
+      useful:      kind === "useful" ? newPage : 0,
+    }),
   });
 }
 
@@ -1205,9 +1362,7 @@ async function handleUnlinkConfirm(interaction) {
 }
 
 async function handleAdminViewMode(interaction, link, mode) {
-  if (!link) {
-    return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
-  }
+  if (!link) return notLinkedReply(interaction);
 
   await interaction.deferUpdate();
 
@@ -1286,13 +1441,12 @@ async function handleRegisterUserSelect(interaction) {
     return { link, already };
   });
 
-  if (!link) {
-    return interaction.update({ content: "❌ This channel isn't linked to a tracker.", embeds: [], components: [] });
-  }
+  if (!link) return notLinkedUpdate(interaction);
 
+  await interaction.deferUpdate();
   if (!already) await refreshRegisteredView(interaction, link);
 
-  await interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildAdminMenuRows(link) });
+  await interaction.editReply({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildAdminMenuRows(link) });
   await interaction.followUp({
     content: already ? `✅ <@${targetId}> is already registered.` : `✅ <@${targetId}> has been registered in this channel's tracker view.`,
     flags: MessageFlags.Ephemeral,
@@ -1308,14 +1462,7 @@ async function handleMenuButton(interaction) {
   if (id === "menu:status")     return handleMenuStatus(interaction, link);
   if (id === "menu:register")   return handleSelfRegister(interaction, link);
   if (id === "menu:unregister") return handleSelfUnregister(interaction, link);
-  if (id === "menu:dm") {
-    if (!link) return interaction.reply({ content: "❌ This channel isn't linked to a tracker.", flags: MessageFlags.Ephemeral });
-    return interaction.update({ embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction))], components: buildDmMenuRows(link, interaction.user.id) });
-  }
-  if (id === "menu:dmprog:on")    return handleSelfDmProgOn(interaction, link);
-  if (id === "menu:dmprog:off")   return handleSelfDmProgOff(interaction, link);
-  if (id === "menu:dmuseful:on")  return handleSelfDmUsefulOn(interaction, link);
-  if (id === "menu:dmuseful:off") return handleSelfDmUsefulOff(interaction, link);
+  if (id === "menu:dm") return handleDmMenu(interaction, link);
 
   // Everything below is admin-only.
   if (id.startsWith("menu:admin") && !hasManageChannels(interaction)) {
@@ -1367,7 +1514,7 @@ async function handleHelp(interaction) {
           "Opens the bot menu for this channel:\n" +
           "- **Status** — preview tracker status with a **Post to channel** button.\n" +
           "- **Register** / **Unregister** — add or remove yourself from the registered view (only shown once the channel's view mode is **Registered Only**).\n" +
-          "- **DM Notifications** — opens a submenu to toggle **Progression** and **Useful** item DMs, each sent whenever you receive that kind of item in this tracker.\n" +
+          "- **DM Notifications** — opens a submenu with a dropdown per item kind (**Progression**, **Useful**). Picking a game in the dropdown toggles it on/off (its description shows current state); the dropdown's own label shows how many are on. **Enable All** covers the whole roster, including games added later; the dropdown is disabled while that's on — hit **Disable All** first to pick individually.\n" +
           "- **Admin Actions** *(Manage Channels only)* — link/unlink this channel's tracker, switch view mode between **Show All** and **Registered Only**, or register another player.",
       },
       { name: "`/help`", value: "Show this message." },
@@ -1378,6 +1525,14 @@ async function handleHelp(interaction) {
 }
 
 // ─── Client ───────────────────────────────────────────────────────────────────
+
+// Without this, an unhandled rejection anywhere (a missed .catch on a fire-and-forget call, an
+// unguarded await in a timer) kills the whole process — every interaction in flight at that
+// moment fails with Discord's generic "This interaction failed", regardless of which button or
+// menu the user actually clicked.
+process.on("unhandledRejection", err => {
+  console.error("[unhandled rejection]", err);
+});
 
 const client = new Client({
   intents: [
@@ -1487,15 +1642,20 @@ client.on("interactionCreate", async interaction => {
       if (interaction.commandName === "help") return await handleHelp(interaction);
     }
     if (interaction.isButton()) {
-      if (interaction.customId.startsWith("pg:"))   return await handlePageButton(interaction);
-      if (interaction.customId.startsWith("post:")) return await handlePostButton(interaction);
-      if (interaction.customId.startsWith("menu:")) return await handleMenuButton(interaction);
+      if (interaction.customId.startsWith("pg:"))              return await handlePageButton(interaction);
+      if (interaction.customId.startsWith("post:"))            return await handlePostButton(interaction);
+      if (interaction.customId.startsWith("menu:dmslotpage:")) return await handleDmSlotPageButton(interaction);
+      if (interaction.customId.startsWith("menu:dmslotall:"))  return await handleDmSlotAllToggle(interaction);
+      if (interaction.customId.startsWith("menu:"))            return await handleMenuButton(interaction);
     }
     if (interaction.isModalSubmit()) {
       if (interaction.customId === "modal:link") return await handleLinkModalSubmit(interaction);
     }
     if (interaction.isUserSelectMenu()) {
       if (interaction.customId === "menu:admin:registeruser:select") return await handleRegisterUserSelect(interaction);
+    }
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId.startsWith("menu:dmslot:")) return await handleDmSlotSelect(interaction);
     }
   } catch (err) {
     if (err.code === 10062) return; // interaction expired (e.g. bot restarted mid-flight) — nothing to do
