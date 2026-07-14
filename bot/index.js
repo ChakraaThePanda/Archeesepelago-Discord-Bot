@@ -549,10 +549,13 @@ const DM_SLOTS_PER_PAGE = 25; // Discord's per-select option cap
 // "every game listed one by one" clutter this avoids. Instead the placeholder itself carries a
 // live count, and each option's description (not its checked state) shows current on/off — so
 // picking an option here toggles that one game rather than replacing the page's whole selection.
-function buildDmSlotRows(kind, ownedGames, setting, page) {
+function buildDmSlotRows(kind, ownedGames, setting, page, otherPage) {
   const isAll       = setting === "all";
   const totalPages  = Math.max(1, Math.ceil(ownedGames.length / DM_SLOTS_PER_PAGE));
   const clampedPage = Math.max(0, Math.min(page, totalPages - 1));
+  // Both sections page over the same ownedGames list, so totalPages is shared — otherPage just
+  // needs clamping the same way to stay valid if it's ever out of range.
+  const clampedOtherPage = Math.max(0, Math.min(otherPage, totalPages - 1));
   const pageGames   = ownedGames.slice(clampedPage * DM_SLOTS_PER_PAGE, (clampedPage + 1) * DM_SLOTS_PER_PAGE);
   const label       = kind === "progression" ? "Progression" : "Useful";
   const pageSuffix  = totalPages > 1 ? ` — page ${clampedPage + 1}/${totalPages}` : "";
@@ -565,7 +568,7 @@ function buildDmSlotRows(kind, ownedGames, setting, page) {
     : `${onCount === 0 ? "❌" : "✅"} ${onCount} of ${ownedGames.length} ${label} enabled${pageSuffix}`;
 
   const select = new StringSelectMenuBuilder()
-    .setCustomId(`menu:dmslot:${kind}:${clampedPage}`)
+    .setCustomId(`menu:dmslot:${kind}:${clampedPage}:${clampedOtherPage}`)
     .setPlaceholder(placeholder)
     .setDisabled(isAll)
     .setMinValues(0)
@@ -581,13 +584,13 @@ function buildDmSlotRows(kind, ownedGames, setting, page) {
 
   const controls = [
     isAll
-      ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
-      : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
+      ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off:${clampedPage}:${clampedOtherPage}`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
+      : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on:${clampedPage}:${clampedOtherPage}`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
   ];
   if (totalPages > 1) {
     controls.push(
-      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:p:${clampedPage}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
-      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:n:${clampedPage}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
+      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:p:${clampedPage}:${clampedOtherPage}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
+      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:n:${clampedPage}:${clampedOtherPage}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
     );
   }
 
@@ -613,8 +616,8 @@ function buildDmMenuRows(link, userId, ownedGames, pages = {}) {
 
   const settings = link.dmSlotSettings?.[userId] ?? {};
   const rows = [
-    ...buildDmSlotRows("progression", ownedGames, settings.progression, pages.progression ?? 0),
-    ...buildDmSlotRows("useful", ownedGames, settings.useful, pages.useful ?? 0),
+    ...buildDmSlotRows("progression", ownedGames, settings.progression, pages.progression ?? 0, pages.useful ?? 0),
+    ...buildDmSlotRows("useful", ownedGames, settings.useful, pages.useful ?? 0, pages.progression ?? 0),
     backToMenuRow(),
   ];
   return rows;
@@ -1152,8 +1155,9 @@ async function handleDmMenu(interaction, link) {
 // buildDmSlotRows), so each submitted value is a flip: on->off or off->on. Games not picked are
 // left exactly as they were, on any page.
 async function handleDmSlotSelect(interaction) {
-  const [, , kind, pageStr] = interaction.customId.split(":");
-  const page = parseInt(pageStr, 10);
+  const [, , kind, pageStr, otherPageStr] = interaction.customId.split(":");
+  const page      = parseInt(pageStr, 10);
+  const otherPage = parseInt(otherPageStr, 10);
   const key  = linkKey(interaction.guildId, interaction.channelId);
   const link = loadLinks()[key];
 
@@ -1191,8 +1195,8 @@ async function handleDmSlotSelect(interaction) {
   await interaction.editReply({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
     components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, {
-      progression: kind === "progression" ? page : 0,
-      useful:      kind === "useful" ? page : 0,
+      progression: kind === "progression" ? page : otherPage,
+      useful:      kind === "useful" ? page : otherPage,
     }),
   });
 }
@@ -1200,7 +1204,9 @@ async function handleDmSlotSelect(interaction) {
 // Dedicated Enable All / Disable All button — a single unconditional action, so there's no
 // ambiguity with whatever the per-game select happens to show.
 async function handleDmSlotAllToggle(interaction) {
-  const [, , kind, action] = interaction.customId.split(":");
+  const [, , kind, action, pageStr, otherPageStr] = interaction.customId.split(":");
+  const page      = parseInt(pageStr, 10);
+  const otherPage = parseInt(otherPageStr, 10);
   const key  = linkKey(interaction.guildId, interaction.channelId);
   const link = loadLinks()[key];
 
@@ -1227,13 +1233,17 @@ async function handleDmSlotAllToggle(interaction) {
 
   await interaction.editReply({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
-    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames),
+    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, {
+      progression: kind === "progression" ? page : otherPage,
+      useful:      kind === "useful" ? page : otherPage,
+    }),
   });
 }
 
 async function handleDmSlotPageButton(interaction) {
-  const [, , kind, dir, pageStr] = interaction.customId.split(":");
-  const fromPage = parseInt(pageStr, 10);
+  const [, , kind, dir, pageStr, otherPageStr] = interaction.customId.split(":");
+  const fromPage  = parseInt(pageStr, 10);
+  const otherPage = parseInt(otherPageStr, 10);
   const key      = linkKey(interaction.guildId, interaction.channelId);
   const link     = loadLinks()[key];
 
@@ -1254,8 +1264,8 @@ async function handleDmSlotPageButton(interaction) {
   await interaction.editReply({
     embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
     components: buildDmMenuRows(link, interaction.user.id, ownedGames, {
-      progression: kind === "progression" ? newPage : 0,
-      useful:      kind === "useful" ? newPage : 0,
+      progression: kind === "progression" ? newPage : otherPage,
+      useful:      kind === "useful" ? newPage : otherPage,
     }),
   });
 }
@@ -1660,7 +1670,9 @@ client.on("interactionCreate", async interaction => {
   } catch (err) {
     if (err.code === 10062) return; // interaction expired (e.g. bot restarted mid-flight) — nothing to do
     console.error(`[${interaction.commandName ?? interaction.customId}]`, err);
-    const msg = `❌ Unexpected error: ${err.message}`;
+    const msg = err.code === 50001
+      ? "❌ I don't have permission to post in this channel. Check that my role has **View Channel** and **Send Messages** here, then try again."
+      : `❌ Unexpected error: ${err.message}`;
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: msg, embeds: [], components: [] });
