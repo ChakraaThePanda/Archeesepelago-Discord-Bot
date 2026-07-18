@@ -265,14 +265,16 @@ async function checkNewItemDms(data, guild, key) {
     const senderLabel = p.senderGame ? `${p.senderGame.game} (${p.senderGame.name})` : `Player ${p.senderPlayer}`;
     const trackerUrl  = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${p.trackerId}`;
 
-    // Description is just the plain item name — Discord's mobile push preview renders the embed
-    // title + full description, but no fields, so this keeps the notification to just the
-    // header/kind and the item name, nothing else. "Tracker" is a field, matching the term used
-    // everywhere else in the bot ("Link Tracker", "this tracker"), placed last so it sits at the
-    // bottom of the embed.
+    // Title leads with the tracker + slot name so it's the first thing visible when running
+    // multiple trackers at once — Discord's mobile push preview renders the embed title + full
+    // description, but no fields, so this keeps that identifying info in the notification itself
+    // instead of buried in a field you only see once you open the DM. Kind (progression/useful)
+    // is conveyed by color alone, no field needed. "Tracker" is still a field (matching the term
+    // used everywhere else in the bot — "Link Tracker", "this tracker"), placed last so it sits
+    // at the bottom of the embed.
     const embed = new EmbedBuilder()
       .setColor(p.kind === "useful" ? 0x2f6feb : 0x9b30ff)
-      .setTitle(p.kind === "useful" ? "Useful Item Received" : "Progression Item Received")
+      .setTitle(`${p.title} (${p.game.name})`)
       .setDescription(itemName)
       .addFields(
         { name: "Received In", value: `${p.game.game} (${p.game.name})` },
