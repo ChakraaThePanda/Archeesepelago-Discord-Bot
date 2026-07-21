@@ -656,7 +656,6 @@ function buildUnlinkConfirmRows() {
 // ─── Auto-refresh ─────────────────────────────────────────────────────────────
 
 const REFRESH_INTERVAL_MS   = 5 * 60 * 1000;
-const INACTIVITY_TIMEOUT_MS = 60 * 60 * 1000;
 const STALE_LINK_MS         = 30 * 24 * 60 * 60 * 1000;
 
 // Map<channelId, { messages, trackerId, guild, lastHash, lastActivityAt, mode, registeredUserIds, intervalId }>
@@ -740,14 +739,15 @@ function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, 
       // this tick never has to hold a stale in-memory links snapshot across these awaits.
       await checkNewItemDms(data, guild, key);
 
-      if (now - session.lastActivityAt > INACTIVITY_TIMEOUT_MS) {
+      // No idle timeout — the loop (and item DMs with it) keeps running for as long as the
+      // link exists, so opting into DMs doesn't silently stop working after an hour of quiet.
+      // The only teardown is the 30-day stale-link sweep, and it leaves the last-posted embed
+      // exactly as it was rather than editing it to a "stopped" state.
+      const currentLink = loadLinks()[key];
+      const lastSeen    = Math.max(currentLink?.linkedAt ?? 0, session.lastActivityAt);
+      if (lastSeen > 0 && now - lastSeen > STALE_LINK_MS) {
         stopAutoRefresh(channelId);
-        const pages = await buildStatusPages(trackerId, data, guild, "stopped", session.mode, session.registeredUserIds);
-        for (let i = 0; i < session.messages.length; i++) {
-          try { await session.messages[i].edit({ embeds: [pages[i] ?? pages[pages.length - 1]], components: [] }); }
-          catch { /* message gone */ }
-        }
-        await clearMessageFromLinks(guild.id, channelId);
+        await deleteLinkEntry(guild.id, channelId);
         return;
       }
 
@@ -889,7 +889,6 @@ async function buildStatusPages(trackerId, data, guild, refreshStatus = null, mo
     tz.includes(' ') ? tz.split(' ').map(w => w[0]).join('') : tz
   );
   const refreshLine = refreshStatus === "active"      ? `⟳ Updates every 5 min — Last Updated: ${nowStr}`
-                    : refreshStatus === "stopped"     ? `⏹️ Stopped refreshing (1h inactivity) — Last Updated: ${nowStr}`
                     : refreshStatus === "superseded"  ? `⊘ Superseded by a newer post`
                     : null;
 
@@ -1593,7 +1592,6 @@ client.once("clientReady", async () => {
     first = false;
 
     const [guildId, channelId] = key.split(":");
-    const stale                = now - (link.lastActivityAt ?? 0) > INACTIVITY_TIMEOUT_MS;
     const mode                 = link.mode ?? "all";
     const registeredUsers      = link.registeredUsers ?? [];
 
@@ -1602,31 +1600,21 @@ client.once("clientReady", async () => {
       const channel = await client.channels.fetch(channelId);
       const data    = await ctGet(`/tracker/${link.trackerId}`);
 
-      if (stale) {
-        const pages = await buildStatusPages(link.trackerId, data, guild, "stopped", mode, registeredUsers);
-        for (let i = 0; i < link.messageIds.length; i++) {
-          try {
-            const msg = await channel.messages.fetch(link.messageIds[i]);
-            await msg.edit({ embeds: [pages[i] ?? pages[pages.length - 1]], components: [] });
-          } catch { /* message gone */ }
-        }
-      } else {
-        const messages = [];
-        for (const msgId of link.messageIds) {
-          try { messages.push(await channel.messages.fetch(msgId)); }
+      const messages = [];
+      for (const msgId of link.messageIds) {
+        try { messages.push(await channel.messages.fetch(msgId)); }
+        catch { /* message gone */ }
+      }
+      if (messages.length > 0) {
+        const pages = await buildStatusPages(link.trackerId, data, guild, "active", mode, registeredUsers);
+        for (let i = 0; i < messages.length; i++) {
+          if (!pages[i]) break;
+          try { await messages[i].edit({ embeds: [pages[i]], components: [] }); }
           catch { /* message gone */ }
         }
-        if (messages.length > 0) {
-          const pages = await buildStatusPages(link.trackerId, data, guild, "active", mode, registeredUsers);
-          for (let i = 0; i < messages.length; i++) {
-            if (!pages[i]) break;
-            try { await messages[i].edit({ embeds: [pages[i]], components: [] }); }
-            catch { /* message gone */ }
-          }
-          startAutoRefresh(messages, link.trackerId, guild, data, hashTrackerData(data), link.lastActivityAt, mode, registeredUsers);
-          console.log(`[resume] Restored and updated auto-refresh for ${key}`);
-          continue;
-        }
+        startAutoRefresh(messages, link.trackerId, guild, data, hashTrackerData(data), link.lastActivityAt, mode, registeredUsers);
+        console.log(`[resume] Restored and updated auto-refresh for ${key}`);
+        continue;
       }
     } catch (err) {
       if (err.code === 10003 || err.code === 10004) {
