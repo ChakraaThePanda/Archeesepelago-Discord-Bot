@@ -751,13 +751,14 @@ function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, 
         return;
       }
 
-      if (changed) {
-        const pages = await buildStatusPages(trackerId, data, guild, "active", session.mode, session.registeredUserIds);
-        for (let i = 0; i < session.messages.length; i++) {
-          if (!pages[i]) break;
-          try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
-          catch { /* message gone */ }
-        }
+      // Edited every tick regardless of `changed` — the footer promises "Updates every 5
+      // min", so Last Updated needs to reflect that a check actually happened, not just the
+      // last time the tracker data itself moved.
+      const pages = await buildStatusPages(trackerId, data, guild, "active", session.mode, session.registeredUserIds);
+      for (let i = 0; i < session.messages.length; i++) {
+        if (!pages[i]) break;
+        try { await session.messages[i].edit({ embeds: [pages[i]], components: [] }); }
+        catch { /* message gone */ }
       }
     } catch (err) {
       console.error("[auto-refresh]", err);
