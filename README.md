@@ -9,7 +9,7 @@ Posts Archipelago multiworld room status from [CheeseTrackers](https://cheesetra
 ### 1. Download the bot
 Go to the [GitHub repo](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot) → green **Code** button → **Download ZIP**, then extract it somewhere.
 
-> **Already have a copy and just want the latest updates?** **Code → Download ZIP** always gives you the current version, but extracting it straight over your existing folder will reset `bot/archeesepelago.conf` back to its blank template, wiping your saved token/API key (`bot/links.json` isn't part of the download, so your linked channels are safe either way). Extract the new ZIP to a separate folder instead, then copy your filled-in `archeesepelago.conf` (and `links.json`, if you want to carry over existing links) from the old folder into the new one.
+> **Updating an existing install?** Extract to a new folder, not over the old one. `bot/archeesepelago.conf` ships with the download and would get reset to its blank template. Copy your filled-in `archeesepelago.conf` (and `links.json`, to keep existing tracker links) into the new folder after.
 
 ### 2. Create a Discord bot
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application**
