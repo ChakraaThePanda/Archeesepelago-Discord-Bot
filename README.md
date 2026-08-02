@@ -6,15 +6,20 @@ Posts Archipelago multiworld room status from [CheeseTrackers](https://cheesetra
 
 ## Quick Start
 
-### 1. Create a Discord bot
+### 1. Download the bot
+Go to the [GitHub repo](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot) → green **Code** button → **Download ZIP**, then extract it somewhere.
+
+> **Already have a copy and just want the latest updates?** **Code → Download ZIP** always gives you the current version, but extracting it straight over your existing folder will reset `bot/archeesepelago.conf` back to its blank template, wiping your saved token/API key (`bot/links.json` isn't part of the download, so your linked channels are safe either way). Extract the new ZIP to a separate folder instead, then copy your filled-in `archeesepelago.conf` (and `links.json`, if you want to carry over existing links) from the old folder into the new one.
+
+### 2. Create a Discord bot
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application**
 2. Under **Bot**: click **Reset Token** and copy your token. Enable **Server Members Intent** under Privileged Gateway Intents.
 3. Under **OAuth2**: generate an invite URL with the `bot` and `applications.commands` scopes and the **View Channels** + **Send Messages** + **Embed Links** permissions, then invite the bot to your server
 
-### 2. Get your CheeseTrackers API key
+### 3. Get your CheeseTrackers API key
 Log in at CheeseTrackers → click your profile → copy your API key.
 
-### 3. Configure and run
+### 4. Configure and run
 Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/run.bat`.
 
 `run.bat` handles everything automatically on first run:
