@@ -320,6 +320,19 @@ async function computeItemCountBaseline(data) {
   return counts;
 }
 
+// checkNewItemDms bails out before touching itemCounts whenever dmSlotSettings is empty (see its
+// guard), so the baseline sits frozen at whatever it was at link time for as long as nobody on
+// this link has ever opted into item DMs. Call this right before a dmSlotSettings write takes
+// effect — if it's the link's first-ever opt-in, the frozen baseline would otherwise misreport
+// everything received since link time as newly-received on the very next tick, flooding that
+// user. Re-baseline to "now" instead, same as the link-time baseline.
+async function rebaselineItemCountsIfFirstOptIn(l, data) {
+  const hadAnyDmSettings = !!l.dmSlotSettings && Object.keys(l.dmSlotSettings).length > 0;
+  if (hadAnyDmSettings) return;
+  const baseline = await computeItemCountBaseline(data);
+  if (baseline) l.itemCounts = baseline;
+}
+
 const CT_HOST = "cheesetrackers.theincrediblewheelofchee.se";
 
 function parseTrackerId(input) {
@@ -761,7 +774,14 @@ function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, 
         catch { /* message gone */ }
       }
     } catch (err) {
-      console.error("[auto-refresh]", err);
+      // FetchError covers transient network blips (DNS hiccups, dropped connections) against
+      // either the CT or AP webhost APIs — expected occasionally over a bot's uptime, and this
+      // loop already self-heals by retrying next tick, so it doesn't need a full stack trace.
+      if (err.name === "FetchError") {
+        console.warn(`[auto-refresh] Fetch failed, will retry next tick: ${err.message}`);
+      } else {
+        console.error("[auto-refresh]", err);
+      }
       if (err.code === 10008) {
         await clearMessageFromLinks(guild.id, channelId);
         stopAutoRefresh(channelId);
@@ -1176,8 +1196,9 @@ async function handleDmSlotSelect(interaction) {
 
   const toggledPositions = interaction.values.map(Number);
 
-  const freshLink = await withLinks(freshLinks => {
+  const freshLink = await withLinks(async freshLinks => {
     const l = freshLinks[key];
+    await rebaselineItemCountsIfFirstOptIn(l, data);
     l.dmSlotSettings ??= {};
     l.dmSlotSettings[interaction.user.id] ??= {};
     const prevSetting = l.dmSlotSettings[interaction.user.id][kind];
@@ -1223,8 +1244,9 @@ async function handleDmSlotAllToggle(interaction) {
     return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  const freshLink = await withLinks(freshLinks => {
+  const freshLink = await withLinks(async freshLinks => {
     const l = freshLinks[key];
+    await rebaselineItemCountsIfFirstOptIn(l, data);
     l.dmSlotSettings ??= {};
     l.dmSlotSettings[interaction.user.id] ??= {};
     l.dmSlotSettings[interaction.user.id][kind] = action === "on" ? "all" : [];
