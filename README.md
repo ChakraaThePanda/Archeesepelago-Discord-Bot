@@ -42,9 +42,11 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 - **Status** *(Everyone)*: shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
 - **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)*: adds/removes you from the channel's **Registered Only** view.
-- **DM Notifications** *(Everyone)*: opens a submenu with a dropdown per item kind — **Progression** and **Useful** — plus an **Enable All / Disable All** button. The dropdown's label shows how many games are currently on; picking a game toggles it (its description shows its current state) rather than replacing the whole list, so the closed dropdown stays a compact count instead of listing every selected game. While **Enable All** is on, the dropdown is disabled (everything's already covered, including games added to the room later) — hit **Disable All** to pick individually. Rosters over 25 games page across multiple dropdowns.
+- **DM Notifications** *(Everyone)*: choose which games send you a DM. There are three tabs, **Progression**, **Useful**, and **Hints**, each with a dropdown to turn individual games on/off, plus an **Enable All** / **Disable All** button.
 
-  Both kinds are detected directly from the Archipelago room's own item data (via the tracker's linked Archipelago webhost), not just hinted items. Items you find yourself (including in any other game you claim in the same room) don't trigger a DM, only items sent to you from someone else's world do.
+  **Progression** and **Useful** DMs tell you when you receive an important item from someone else's world. Items you find yourself don't count.
+
+  **Hints** DMs tell you about hints on Progression or Useful items only: either "here's where your item is hiding" (in someone else's game) or "someone's item was just found hiding in your game." You won't get a DM for junk/trap items, hints about things you already know, or hints about your own stuff in your own game.
 - **Admin Actions** *(Manage Channels)*: opens a submenu:
   - **Link Tracker** / **Update Tracker**: opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
   - **Unlink Channel**: removes the channel's link (with a confirmation step) and stops auto-refresh.
@@ -79,7 +81,7 @@ Large rooms are split across multiple embeds/messages (paged in the **Status** p
 
 Once posted via **Post to channel**, a status post updates itself automatically:
 - Refreshes every 5 minutes if the tracker data changed
-- Stops refreshing after 1 hour with no changes, marking the post as stopped
+- Keeps refreshing for as long as the channel stays linked (see below for when a link is removed)
 - Posting again supersedes the previous live post and starts a fresh refresh cycle
 
 ---

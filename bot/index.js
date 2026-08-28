@@ -33,14 +33,18 @@ const LINKS_FILE    = path.join(__dirname, "links.json");
 
 // ─── Persistent Links (JSON) ──────────────────────────────────────────────────
 // Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?,
-//   lastActivityAt?, dmSlotSettings?, itemCounts? } }
-// dmSlotSettings: { [discordUserId]: { progression?: "all" | apPlayerPosition[], useful?: "all" | apPlayerPosition[] } }
-// — per-user, per-slot opt-in to Progression / Useful item DMs for this channel's tracker. "all"
-// means every slot the user owns, including ones added to the room later; an array is an explicit
-// subset of AP player positions. A kind absent from a user's entry means DMs are off for it.
+//   lastActivityAt?, dmSlotSettings?, itemCounts?, hintKeys? } }
+// dmSlotSettings: { [discordUserId]: { progression?: "all" | apPlayerPosition[], useful?: "all" | apPlayerPosition[],
+//   hint?: "all" | apPlayerPosition[] } }
+// This is per-user, per-slot opt-in to Progression / Useful item DMs and Hint Received DMs for this
+// channel's tracker. "all" means every slot the user owns, including ones added to the room later;
+// an array is an explicit subset of AP player positions. A kind absent from a user's entry means
+// DMs are off for it.
 // itemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only. Shared
 // baseline for both progression and useful DMs, since it just tracks total items received (it's
 // not "progression-only" despite the field's old name).
+// hintKeys: { [apPlayerPosition]: hintKey[] }, the identity keys of hints already seen/notified for
+// that position (as the hint's receiving player), used to detect newly-created hints only.
 
 function loadLinks() {
   if (!fs.existsSync(LINKS_FILE)) return {};
@@ -124,6 +128,27 @@ async function ctGetFresh(endpoint, attempt = 0) {
 
 const PROGRESSION_FLAG = 0b00001; // ItemClassification.progression bit
 const USEFUL_FLAG      = 0b00010; // ItemClassification.useful bit
+const TRAP_FLAG        = 0b00100; // ItemClassification.trap bit
+
+// DM embed colors, one per notification kind.
+const PROGRESSION_DM_COLOR = 0x9b30ff; // Purple
+const USEFUL_DM_COLOR      = 0x2f6feb; // Blue
+const HINT_DM_COLOR        = 0x1abc9c; // Teal
+
+// Human-readable classification label for a hint's item_flags, shown next to the item name in
+// hint DMs since, unlike item-received DMs, there's no separate opt-in per classification to
+// imply it. Trap takes priority over progression/useful since a trap can carry either bit too.
+// Deliberately NOT reused for the progression/useful item-DM routing check below (which tests
+// PROGRESSION_FLAG/USEFUL_FLAG directly, gated by each user's own opt-in, and ignores trap
+// entirely). That check decides which opt-in bucket a received item routes to, while this decides
+// what label to print. A "progression trap" should still route as progression there; folding
+// the two together would make it silently stop matching once trap-priority kicks in here.
+function classifyItemFlags(flags) {
+  if (flags & TRAP_FLAG) return "Trap";
+  if (flags & PROGRESSION_FLAG) return "Progression";
+  if (flags & USEFUL_FLAG) return "Useful";
+  return "Filler";
+}
 
 function deriveApTrackerInfo(upstreamUrl) {
   const url = new URL(upstreamUrl);
@@ -139,28 +164,59 @@ async function apGet(origin, endpoint) {
   return res.json();
 }
 
-// Cache of datapackage item-id -> item-name maps, keyed by `${game}::${checksum}`.
+// Cache of datapackage id->name maps (items and locations), keyed by `${game}::${checksum}`.
 // Safe to keep for the process lifetime — a checksum uniquely identifies a datapackage version.
+// Item ids live in the receiving game's namespace; location ids live in the finding game's
+// namespace, so callers pick whichever game/checksum matches what they're looking up.
 const datapackageCache = new Map();
 
-async function getItemIdToNameMap(origin, game, checksum) {
+async function getDatapackageMaps(origin, game, checksum) {
   const key = `${game}::${checksum}`;
   if (datapackageCache.has(key)) return datapackageCache.get(key);
 
   const pkg = await apGet(origin, `/api/datapackage/${checksum}`);
-  const idToName = {};
-  for (const [name, id] of Object.entries(pkg.item_name_to_id ?? {})) idToName[id] = name;
-  datapackageCache.set(key, idToName);
-  return idToName;
+  const itemIdToName = {};
+  for (const [name, id] of Object.entries(pkg.item_name_to_id ?? {})) itemIdToName[id] = name;
+  const locationIdToName = {};
+  for (const [name, id] of Object.entries(pkg.location_name_to_id ?? {})) locationIdToName[id] = name;
+
+  const maps = { itemIdToName, locationIdToName };
+  datapackageCache.set(key, maps);
+  return maps;
 }
 
-// Diffs each opted-in user's received items against the link's itemCounts and DMs
-// them for any newly-received item flagged as progression and/or useful (per their own opt-in).
-// Looks the link up fresh (by `key`) itself, inside withLinks, right before persisting — the
-// network fetches below all happen before that lock is taken, so this never holds up other menu
-// actions for longer than the synchronous diff. Never throws — failures are logged and treated
-// as "no update".
-async function checkNewItemDms(data, guild, key) {
+// getDatapackageMaps, but never throws: returns null (after logging) on a missing game/checksum
+// or a fetch failure. Lets callers fire the item-name and location-name lookups for one DM
+// together via Promise.all instead of sequentially, since they're independent fetches (different
+// game/checksum pairs).
+async function getDatapackageMapsOrNull(origin, game, checksum, logPrefix) {
+  if (!game || !checksum) return null;
+  try {
+    return await getDatapackageMaps(origin, game.game, checksum);
+  } catch (err) {
+    console.warn(`[${logPrefix}] Failed to load datapackage for ${game.game}:`, err.message);
+    return null;
+  }
+}
+
+// A Hint tuple serializes as [receiving_player, finding_player, location, item, found, entrance,
+// item_flags, status] (Archipelago's WebHostLib NamedTuple -> JSON array convention, same as
+// NetworkItem below). Identity deliberately excludes `found`/`status` (indices 4 and 7), since those
+// can flip after a hint is first seen (e.g. once its location gets checked), and re-keying on them
+// would re-notify for a hint the user has already been DMed about.
+function hintKeyOf(hint) {
+  return JSON.stringify([hint[0], hint[1], hint[2], hint[3], hint[5]]);
+}
+
+// Diffs each opted-in user's received items (against the link's itemCounts) and hints (against
+// hintKeys), DMing for any newly-received item flagged as progression and/or useful, and any
+// newly-created, not-yet-checked hint on a Progression/Useful item, whether it points at one of
+// their items in someone else's world, or at a location in their own world holding someone
+// else's item (per their own opt-in for each). Looks the link up fresh (by `key`) itself, inside
+// withLinks, right before persisting, since the network fetches below all happen before that lock is
+// taken, so this never holds up other menu actions for longer than the synchronous diff. Never
+// throws; failures are logged and treated as "no update".
+async function checkNewDms(data, guild, key) {
   const peek = loadLinks()[key];
   if (!peek?.dmSlotSettings || !Object.keys(peek.dmSlotSettings).length) return;
 
@@ -185,13 +241,20 @@ async function checkNewItemDms(data, guild, key) {
   }
 
   const playerItemsReceived = trackerData.player_items_received ?? [];
-  if (!playerItemsReceived.length) return;
+  const playerHints         = trackerData.hints ?? [];
+  if (!playerItemsReceived.length && !playerHints.length) return;
+
+  // CT can return a falsy title (see buildStatusPages' own `title || "Tracker Status"` fallback).
+  // embed.setTitle() throws on an empty string, and that throw isn't caught per-recipient, so
+  // an unguarded raw title would silently drop every remaining DM in this tick.
+  const trackerTitle = data.title || "Tracker Status";
 
   // O(1) position lookups instead of scanning `data.games` per entry/item — this room type can
   // have 1000+ slots, and the old .find() calls ran once per changed slot plus once per item.
   const gameByPosition = new Map((data.games ?? []).map(g => [g.position, g]));
 
-  const pending = [];
+  const pendingItems = [];
+  const pendingHints = [];
 
   await withLinks(links => {
     const link = links[key];
@@ -233,7 +296,7 @@ async function checkNewItemDms(data, guild, key) {
         // player (the world where the check happened), not the receiver. If that slot is claimed
         // by the same Discord user (even a different one of their games), they found it
         // themselves and already saw it live, so skip the DM.
-        const [itemId, , senderPlayer, flags = 0] = netItem;
+        const [itemId, locationId, senderPlayer, flags = 0] = netItem;
 
         let kind;
         if (wantsProgression && (flags & PROGRESSION_FLAG)) kind = "progression";
@@ -241,43 +304,137 @@ async function checkNewItemDms(data, guild, key) {
         else continue;
 
         const senderGame = gameByPosition.get(senderPlayer);
-        const senderUsername = senderGame?.effective_discord_username?.toLowerCase();
-        const senderMember = senderUsername ? memberByUsername.get(senderUsername) : null;
+        const senderMember = resolveOwnerMember(memberByUsername, senderGame);
         if (senderMember && senderMember.id === member.id) continue;
 
-        pending.push({ kind, member, game, senderGame, senderPlayer, itemId, checksum, trackerId: link.trackerId, title: data.title });
+        // Location ids live in the SENDING game's namespace (the location belongs to the world
+        // where the check happened), unlike item ids which live in the receiving game's namespace.
+        const senderChecksum = senderGame ? staticData?.datapackage?.[senderGame.game]?.checksum : null;
+
+        pendingItems.push({
+          kind, member, game, senderGame, senderPlayer, itemId, locationId,
+          checksum, senderChecksum, trackerId: link.trackerId, title: trackerTitle,
+        });
+      }
+    }
+
+    if (!link.hintKeys) link.hintKeys = {};
+    const hintKeys = link.hintKeys;
+
+    for (const entry of playerHints) {
+      const position = entry.player;
+      // A player's hint list already mixes hints where they're the receiver (their item is
+      // somewhere) and ones where they're the finder (their location holds someone else's item).
+      // See PlayerHints docstring: "relevant" hints. Both are "Hint Received" notifications,
+      // just about different things, so no role filter here: track/diff the whole list.
+      const allHints     = entry.hints ?? [];
+      const currentKeys  = allHints.map(hintKeyOf);
+      const prevKeys     = hintKeys[position];
+
+      if (prevKeys === undefined) {
+        // First time observing this slot's hints: establish a baseline, don't backfill DMs.
+        hintKeys[position] = currentKeys;
+        continue;
+      }
+
+      const prevKeySet = new Set(prevKeys);
+      const newHints    = allHints.filter(h => !prevKeySet.has(hintKeyOf(h)));
+      // Grow-only, like itemCounts, since a transient partial/empty response from the AP webhost
+      // must never shrink the baseline, or previously-seen hints would look "new" again next
+      // tick and get re-DMed.
+      hintKeys[position] = [...new Set([...prevKeys, ...currentKeys])];
+      if (!newHints.length) continue;
+
+      const game = gameByPosition.get(position);
+      if (!game?.effective_discord_username) continue;
+      const member = memberByUsername.get(game.effective_discord_username.toLowerCase());
+      if (!member) continue;
+      const dmSetting = link.dmSlotSettings[member.id];
+      if (!dmSetting || !isSlotSelected(dmSetting.hint, position)) continue;
+
+      // This position's own checksum doubles as the item namespace when it's the receiving
+      // player (its item's id space) and as the location namespace when it's the finding player
+      // (its location's id space); see the two branches below.
+      const ownChecksum = staticData?.datapackage?.[game.game]?.checksum;
+      if (!ownChecksum) continue;
+
+      for (const hint of newHints) {
+        const [receivingPlayer, findingPlayer, location, itemId, found, , itemFlags = 0] = hint;
+        // Already checked by the time we saw it. Whichever side of the hint this is, the
+        // outcome is already old news, so a DM about it would be redundant.
+        if (found) continue;
+
+        // Only Progression and Useful items are worth a hint DM. Filler and Trap aren't
+        // interesting enough to notify about either way. Uses the same classification the embed
+        // itself displays, so an item never gets excluded here yet still shown as "Progression"
+        // in a DM that did go out (or vice versa).
+        const classification = classifyItemFlags(itemFlags);
+        if (classification !== "Progression" && classification !== "Useful") continue;
+
+        if (receivingPlayer === position && findingPlayer !== position) {
+          // Someone hinted a location in THEIR world, and it holds YOUR item.
+          const senderGame = gameByPosition.get(findingPlayer);
+          const senderMember = resolveOwnerMember(memberByUsername, senderGame);
+          if (senderMember && senderMember.id === member.id) continue;
+
+          const senderChecksum = senderGame ? staticData?.datapackage?.[senderGame.game]?.checksum : null;
+
+          pendingHints.push({
+            scenario: "item", member, game, checksum: ownChecksum,
+            otherGame: senderGame, otherPlayer: findingPlayer, otherChecksum: senderChecksum,
+            location, itemId, itemFlags, trackerId: link.trackerId, title: trackerTitle,
+          });
+        } else if (findingPlayer === position && receivingPlayer !== position) {
+          // Someone hinted one of THEIR items, and it's sitting at a location in YOUR world.
+          const receiverGame = gameByPosition.get(receivingPlayer);
+          const receiverMember = resolveOwnerMember(memberByUsername, receiverGame);
+          if (receiverMember && receiverMember.id === member.id) continue;
+
+          const receiverChecksum = receiverGame ? staticData?.datapackage?.[receiverGame.game]?.checksum : null;
+
+          pendingHints.push({
+            scenario: "location", member, game, checksum: ownChecksum,
+            otherGame: receiverGame, otherPlayer: receivingPlayer, otherChecksum: receiverChecksum,
+            location, itemId, itemFlags, trackerId: link.trackerId, title: trackerTitle,
+          });
+        }
+        // else: receivingPlayer === findingPlayer === position, your own item at your own
+        // location (e.g. a shop hover auto-hint). Not interesting, skip.
       }
     }
   });
 
   // Datapackage lookups and the actual DM sends happen after the lock is released — no reason
   // to make other links.json operations wait on Discord API calls.
-  for (const p of pending) {
-    let idToName;
-    try {
-      idToName = await getItemIdToNameMap(apInfo.origin, p.game.game, p.checksum);
-    } catch (err) {
-      console.warn(`[item-dm] Failed to load datapackage for ${p.game.game}:`, err.message);
-      continue;
-    }
+  for (const p of pendingItems) {
+    // Item and location names live in different datapackages (receiving vs. sending game), so fire
+    // both fetches together rather than sequentially since neither depends on the other.
+    const [itemMaps, locationMaps] = await Promise.all([
+      getDatapackageMapsOrNull(apInfo.origin, p.game, p.checksum, "item-dm"),
+      getDatapackageMapsOrNull(apInfo.origin, p.senderGame, p.senderChecksum, "item-dm"),
+    ]);
+    if (!itemMaps) continue;
 
-    const itemName    = idToName[p.itemId] ?? `Item #${p.itemId}`;
-    const senderLabel = p.senderGame ? `${p.senderGame.game} (${p.senderGame.name})` : `Player ${p.senderPlayer}`;
+    const itemName    = itemMaps.itemIdToName[p.itemId] ?? `Item #${p.itemId}`;
+    const locationName = locationMaps?.locationIdToName[p.locationId] ?? null;
+
+    const senderLabel = p.senderGame
+      ? `${p.senderGame.name} (${p.senderGame.game})${locationName ? `\n${locationName}` : ""}`
+      : `Player ${p.senderPlayer}`;
     const trackerUrl  = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${p.trackerId}`;
 
-    // Title leads with the tracker + slot name so it's the first thing visible when running
-    // multiple trackers at once — Discord's mobile push preview renders the embed title + full
-    // description, but no fields, so this keeps that identifying info in the notification itself
-    // instead of buried in a field you only see once you open the DM. Kind (progression/useful)
-    // is conveyed by color alone, no field needed. "Tracker" is still a field (matching the term
-    // used everywhere else in the bot — "Link Tracker", "this tracker"), placed last so it sits
-    // at the bottom of the embed.
+    // Discord's mobile push preview renders the embed title + full description, but no fields, so
+    // description carries both the item name and the receiving slot (no separate "Received In"
+    // field) so that identifying info still shows up in the notification itself, not just once
+    // the DM is opened. Kind (progression/useful) is conveyed by color + author, no field needed.
+    // "Tracker" is still a field (matching the term used everywhere else in the bot: "Link
+    // Tracker", "this tracker"), placed last so it sits at the bottom of the embed.
     const embed = new EmbedBuilder()
-      .setColor(p.kind === "useful" ? 0x2f6feb : 0x9b30ff)
-      .setTitle(`${p.title} (${p.game.name})`)
-      .setDescription(itemName)
+      .setColor(p.kind === "useful" ? USEFUL_DM_COLOR : PROGRESSION_DM_COLOR)
+      .setAuthor({ name: p.kind === "useful" ? "Useful Item Received" : "Progression Item Received" })
+      .setTitle(p.title)
+      .setDescription(`${itemName}\n${p.game.name} (${p.game.game})`)
       .addFields(
-        { name: "Received In", value: `${p.game.game} (${p.game.name})` },
         { name: "Found by", value: senderLabel },
         { name: "Tracker", value: `**[${p.title}](${trackerUrl})**` },
       );
@@ -288,15 +445,65 @@ async function checkNewItemDms(data, guild, key) {
       console.warn(`[item-dm] Failed to DM ${p.member.id}:`, err.message);
     }
   }
+
+  for (const p of pendingHints) {
+    // "item" scenario: p.game is the receiving (your) side, item ids live in its namespace,
+    // and p.otherGame is the finder whose world holds the location.
+    // "location" scenario: p.game is the finding (your) side, location ids live in its
+    // namespace, and p.otherGame is the receiver who'll get the item.
+    const itemGame        = p.scenario === "item" ? p.game : p.otherGame;
+    const itemChecksum    = p.scenario === "item" ? p.checksum : p.otherChecksum;
+    const locationGame     = p.scenario === "item" ? p.otherGame : p.game;
+    const locationChecksum = p.scenario === "item" ? p.otherChecksum : p.checksum;
+
+    // Item and location live in different datapackages (receiving vs. finding game, whichever
+    // side is "yours" for this scenario), so fire both fetches together since they're independent.
+    const [itemMaps, locationMaps] = await Promise.all([
+      getDatapackageMapsOrNull(apInfo.origin, itemGame, itemChecksum, "hint-dm"),
+      getDatapackageMapsOrNull(apInfo.origin, locationGame, locationChecksum, "hint-dm"),
+    ]);
+
+    const itemName  = itemMaps?.itemIdToName[p.itemId] ?? `Item #${p.itemId}`;
+    const itemLabel = `${itemName} (${classifyItemFlags(p.itemFlags)})`;
+    const locationName = locationMaps?.locationIdToName[p.location] ?? `Location #${p.location}`;
+
+    const otherLabel = p.otherGame ? `${p.otherGame.name} (${p.otherGame.game})` : `Player ${p.otherPlayer}`;
+    const yourLabel   = `${p.game.name} (${p.game.game})`;
+    const trackerUrl  = `https://cheesetrackers.theincrediblewheelofchee.se/tracker/${p.trackerId}`;
+
+    const embed = new EmbedBuilder()
+      .setColor(HINT_DM_COLOR)
+      .setAuthor({ name: "New Hint" })
+      .setTitle(p.title);
+
+    if (p.scenario === "item") {
+      embed.addFields(
+        { name: "Your Item", value: `${itemLabel}\n${yourLabel}` },
+        { name: "Their Location", value: `${locationName}\n${otherLabel}` },
+      );
+    } else {
+      embed.addFields(
+        { name: "Your Location", value: `${locationName}\n${yourLabel}` },
+        { name: "Their Item", value: `${itemLabel}\n${otherLabel}` },
+      );
+    }
+    embed.addFields({ name: "Tracker", value: `**[${p.title}](${trackerUrl})**` });
+
+    try {
+      await p.member.send({ embeds: [embed] });
+    } catch (err) {
+      console.warn(`[hint-dm] Failed to DM ${p.member.id}:`, err.message);
+    }
+  }
 }
 
-// Establishes the { [position]: itemCount } baseline from the AP webhost's *current* item
-// counts. Called right when a channel is linked so the baseline reflects that moment, not
-// whatever the tracker looked like the first time someone happened to have DMs enabled during
-// an auto-refresh tick — otherwise anything received in between is silently treated as
-// pre-existing and never DMed. Returns null (and logs) on any fetch failure — link/relink still
-// succeeds, it just leaves the baseline to be established lazily on the next tick as before.
-async function computeItemCountBaseline(data) {
+// Establishes the itemCounts/hintKeys baselines from the AP webhost's *current* state. Called
+// right when a channel is linked so the baseline reflects that moment, not whatever the tracker
+// looked like the first time someone happened to have DMs enabled during an auto-refresh tick,
+// otherwise anything received/hinted in between is silently treated as pre-existing and never
+// DMed. Returns null (and logs) on any fetch failure. Link/relink still succeeds, it just leaves
+// the baselines to be established lazily on the next tick as before.
+async function computeDmBaselines(data) {
   let apInfo;
   try {
     apInfo = deriveApTrackerInfo(data.upstream_url);
@@ -313,24 +520,33 @@ async function computeItemCountBaseline(data) {
     return null;
   }
 
-  const counts = {};
+  const itemCounts = {};
   for (const entry of trackerData.player_items_received ?? []) {
-    counts[entry.player] = (entry.items ?? []).length;
+    itemCounts[entry.player] = (entry.items ?? []).length;
   }
-  return counts;
+
+  const hintKeys = {};
+  for (const entry of trackerData.hints ?? []) {
+    hintKeys[entry.player] = (entry.hints ?? []).map(hintKeyOf);
+  }
+
+  return { itemCounts, hintKeys };
 }
 
-// checkNewItemDms bails out before touching itemCounts whenever dmSlotSettings is empty (see its
-// guard), so the baseline sits frozen at whatever it was at link time for as long as nobody on
-// this link has ever opted into item DMs. Call this right before a dmSlotSettings write takes
-// effect — if it's the link's first-ever opt-in, the frozen baseline would otherwise misreport
-// everything received since link time as newly-received on the very next tick, flooding that
-// user. Re-baseline to "now" instead, same as the link-time baseline.
-async function rebaselineItemCountsIfFirstOptIn(l, data) {
+// checkNewDms bails out before touching itemCounts/hintKeys whenever dmSlotSettings is empty (see
+// its guard), so the baselines sit frozen at whatever they were at link time for as long as
+// nobody on this link has ever opted into any DM kind. Call this right before a dmSlotSettings
+// write takes effect. If it's the link's first-ever opt-in, the frozen baselines would otherwise
+// misreport everything received/hinted since link time as new on the very next tick, flooding
+// that user. Re-baseline to "now" instead, same as the link-time baseline.
+async function rebaselineDmBaselinesIfFirstOptIn(l, data) {
   const hadAnyDmSettings = !!l.dmSlotSettings && Object.keys(l.dmSlotSettings).length > 0;
   if (hadAnyDmSettings) return;
-  const baseline = await computeItemCountBaseline(data);
-  if (baseline) l.itemCounts = baseline;
+  const baselines = await computeDmBaselines(data);
+  if (baselines) {
+    l.itemCounts = baselines.itemCounts;
+    l.hintKeys   = baselines.hintKeys;
+  }
 }
 
 const CT_HOST = "cheesetrackers.theincrediblewheelofchee.se";
@@ -397,13 +613,20 @@ async function buildMemberByUsernameMap(guild) {
   return memberByUsername;
 }
 
+// Resolves a game's claimed Discord owner the same way everywhere in checkNewDms. A game with
+// no claimed owner (or one not resolvable in this guild) yields null.
+function resolveOwnerMember(memberByUsername, game) {
+  const username = game?.effective_discord_username?.toLowerCase();
+  return username ? memberByUsername.get(username) : null;
+}
+
 // A dmSlotSettings value for one kind (progression/useful): "all" every owned slot including
 // future ones, an array of specific AP player positions, or undefined/missing (off).
 function isSlotSelected(setting, position) {
   return setting === "all" || (Array.isArray(setting) && setting.includes(position));
 }
 
-// Games in this tracker owned by `userId`, matched the same way checkNewItemDms resolves a slot's
+// Games in this tracker owned by `userId`, matched the same way checkNewDms resolves a slot's
 // Discord owner (case-insensitive username/global name/nickname). Every call site needs both the
 // full game objects (to render) and the bare positions (to cross-reference stored settings), so
 // this returns both from the one fetch rather than making callers re-derive positions themselves.
@@ -502,57 +725,87 @@ function buildMenuEmbed(link, userId, isManager, ownedPositions = null) {
   const isRegisteredMode = (link.mode ?? "all") === "registered";
   const modeLabel = isRegisteredMode ? "**Registered Only**" : "**Show All**";
 
-  const lines = [`**[Tracker Room](${trackerUrl})**`, `View mode: ${modeLabel}`];
+  const lines = [`**[Tracker Room](${trackerUrl})**`, `View Mode: ${modeLabel}`];
   if (isRegisteredMode) {
     const isRegistered = (link.registeredUsers ?? []).includes(userId);
-    lines.push(isRegistered ? "You are: ✅ **Registered**" : "You are: ❌ **Not registered**");
+    lines.push(isRegistered ? "You Are: ✅ **Registered**" : "You Are: ❌ **Not Registered**");
   }
 
-  lines.push(`Progression item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.progression, ownedPositions)}`);
-  lines.push(`Useful item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.useful, ownedPositions)}`);
+  lines.push(`Progression Item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.progression, ownedPositions)}`);
+  lines.push(`Useful Item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.useful, ownedPositions)}`);
+  lines.push(`Hints DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.hint, ownedPositions)}`);
 
   e.setDescription(lines.join("\n"));
   return e;
 }
 
+// One row instead of one-button-per-row. Discord allows up to 5 buttons per action row, and
+// this menu never has more than 4 (Status, Register/Unregister, DM Notifications, Admin Actions),
+// so they all fit side by side. Chunked defensively in case a future button pushes past 5.
 function buildMainMenuRows(interaction, link) {
-  const rows = [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("menu:status").setLabel("Status").setStyle(ButtonStyle.Success).setDisabled(!link)
-    ),
+  const buttons = [
+    new ButtonBuilder().setCustomId("menu:status").setLabel("Status").setStyle(ButtonStyle.Success).setDisabled(!link),
   ];
 
   if (link && (link.mode ?? "all") === "registered") {
     const isRegistered = (link.registeredUsers ?? []).includes(interaction.user.id);
-    rows.push(
-      new ActionRowBuilder().addComponents(
-        isRegistered
-          ? new ButtonBuilder().setCustomId("menu:unregister").setLabel("Unregister").setStyle(ButtonStyle.Danger)
-          : new ButtonBuilder().setCustomId("menu:register").setLabel("Register").setStyle(ButtonStyle.Success)
-      )
+    buttons.push(
+      isRegistered
+        ? new ButtonBuilder().setCustomId("menu:unregister").setLabel("Unregister").setStyle(ButtonStyle.Danger)
+        : new ButtonBuilder().setCustomId("menu:register").setLabel("Register").setStyle(ButtonStyle.Success)
     );
   }
 
   if (link) {
-    rows.push(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("menu:dm").setLabel("DM Notifications").setStyle(ButtonStyle.Primary)
-      )
+    buttons.push(
+      new ButtonBuilder().setCustomId("menu:dm").setLabel("DM Notifications").setStyle(ButtonStyle.Primary)
     );
   }
 
   if (hasManageChannels(interaction)) {
-    rows.push(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("menu:admin").setLabel("Admin Actions").setStyle(ButtonStyle.Primary)
-      )
+    buttons.push(
+      new ButtonBuilder().setCustomId("menu:admin").setLabel("Admin Actions").setStyle(ButtonStyle.Primary)
     );
   }
 
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(...buttons.slice(i, i + 5)));
+  }
   return rows;
 }
 
 const DM_SLOTS_PER_PAGE = 25; // Discord's per-select option cap
+
+// The three opt-in DM kinds, and the order they're tabbed through in the menu.
+const DM_KINDS = ["progression", "useful", "hint"];
+const DM_KIND_LABELS = { progression: "Progression", useful: "Useful", hint: "Hints" };
+
+// Only one kind's picker (select + controls) is ever shown at a time, since a message caps out at 5
+// action rows, and 3 kinds' worth of select+controls (2 rows each) plus a tab row and a back
+// button would need 8. Each kind still keeps its own page position across tab switches, so the
+// customId threads all three page numbers through regardless of which kind is currently active.
+function encodeDmPages(pages) {
+  return DM_KINDS.map(k => pages[k] ?? 0).join(":");
+}
+
+function decodeDmPages(parts) {
+  const pages = {};
+  DM_KINDS.forEach((k, i) => { pages[k] = parseInt(parts[i], 10) || 0; });
+  return pages;
+}
+
+function buildDmTabRow(activeKind, pages) {
+  const encoded = encodeDmPages(pages);
+  return new ActionRowBuilder().addComponents(
+    ...DM_KINDS.map(k =>
+      new ButtonBuilder()
+        .setCustomId(`menu:dmtab:${k}:${encoded}`)
+        .setLabel(DM_KIND_LABELS[k])
+        .setStyle(k === activeKind ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    )
+  );
+}
 
 // "Enable/Disable All" is a dedicated button, not a select option — mixing it into the select
 // meant unchecking it while individual games still showed checked (inherited from "all") got
@@ -564,15 +817,12 @@ const DM_SLOTS_PER_PAGE = 25; // Discord's per-select option cap
 // "every game listed one by one" clutter this avoids. Instead the placeholder itself carries a
 // live count, and each option's description (not its checked state) shows current on/off — so
 // picking an option here toggles that one game rather than replacing the page's whole selection.
-function buildDmSlotRows(kind, ownedGames, setting, page, otherPage) {
+function buildDmSlotRows(kind, ownedGames, setting, pages) {
   const isAll       = setting === "all";
   const totalPages  = Math.max(1, Math.ceil(ownedGames.length / DM_SLOTS_PER_PAGE));
-  const clampedPage = Math.max(0, Math.min(page, totalPages - 1));
-  // Both sections page over the same ownedGames list, so totalPages is shared — otherPage just
-  // needs clamping the same way to stay valid if it's ever out of range.
-  const clampedOtherPage = Math.max(0, Math.min(otherPage, totalPages - 1));
+  const clampedPage = Math.max(0, Math.min(pages[kind] ?? 0, totalPages - 1));
   const pageGames   = ownedGames.slice(clampedPage * DM_SLOTS_PER_PAGE, (clampedPage + 1) * DM_SLOTS_PER_PAGE);
-  const label       = kind === "progression" ? "Progression" : "Useful";
+  const label       = DM_KIND_LABELS[kind];
   const pageSuffix  = totalPages > 1 ? ` — page ${clampedPage + 1}/${totalPages}` : "";
   // Counts only positions still among ownedGames — a stored array can otherwise still list a
   // position from a game unclaimed since (nothing prunes links.json on unclaim), overcounting.
@@ -582,8 +832,10 @@ function buildDmSlotRows(kind, ownedGames, setting, page, otherPage) {
     ? `All ${label} enabled`
     : `${onCount === 0 ? "❌" : "✅"} ${onCount} of ${ownedGames.length} ${label} enabled${pageSuffix}`;
 
+  const encoded = encodeDmPages({ ...pages, [kind]: clampedPage });
+
   const select = new StringSelectMenuBuilder()
-    .setCustomId(`menu:dmslot:${kind}:${clampedPage}:${clampedOtherPage}`)
+    .setCustomId(`menu:dmslot:${kind}:${encoded}`)
     .setPlaceholder(placeholder)
     .setDisabled(isAll)
     .setMinValues(0)
@@ -599,13 +851,13 @@ function buildDmSlotRows(kind, ownedGames, setting, page, otherPage) {
 
   const controls = [
     isAll
-      ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off:${clampedPage}:${clampedOtherPage}`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
-      : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on:${clampedPage}:${clampedOtherPage}`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
+      ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off:${encoded}`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
+      : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on:${encoded}`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
   ];
   if (totalPages > 1) {
     controls.push(
-      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:p:${clampedPage}:${clampedOtherPage}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
-      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:n:${clampedPage}:${clampedOtherPage}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
+      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:p:${encoded}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
+      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:n:${encoded}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
     );
   }
 
@@ -617,9 +869,10 @@ function buildDmSlotRows(kind, ownedGames, setting, page, otherPage) {
 
 // Takes ownedGames rather than fetching it, so callers can reuse the same fetch for the embed's
 // accurate DM-count lines (see dmSettingSummary) instead of resolving guild membership twice.
-// `pages` optionally pins the current page per kind (e.g. { progression: 1 }) so paging one
-// select doesn't bounce the other back to page 0 when the menu re-renders.
-function buildDmMenuRows(link, userId, ownedGames, pages = {}) {
+// `activeKind` picks which of the 3 kinds' picker is currently shown (see buildDmSlotRows).
+// `pages` pins each kind's own page (e.g. { progression: 1, useful: 0, hint: 0 }) so switching
+// tabs or paging one kind doesn't bounce the others back to page 0 when the menu re-renders.
+function buildDmMenuRows(link, userId, ownedGames, activeKind = "progression", pages = {}) {
   if (!ownedGames.length) {
     return [
       new ActionRowBuilder().addComponents(
@@ -631,8 +884,8 @@ function buildDmMenuRows(link, userId, ownedGames, pages = {}) {
 
   const settings = link.dmSlotSettings?.[userId] ?? {};
   const rows = [
-    ...buildDmSlotRows("progression", ownedGames, settings.progression, pages.progression ?? 0, pages.useful ?? 0),
-    ...buildDmSlotRows("useful", ownedGames, settings.useful, pages.useful ?? 0, pages.progression ?? 0),
+    buildDmTabRow(activeKind, pages),
+    ...buildDmSlotRows(activeKind, ownedGames, settings[activeKind], pages),
     backToMenuRow(),
   ];
   return rows;
@@ -731,7 +984,7 @@ function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, 
     intervalId:        null,
   };
 
-  checkNewItemDms(initialData, guild, key).catch(err => console.error("[item-dm] unexpected failure:", err));
+  checkNewDms(initialData, guild, key).catch(err => console.error("[item-dm] unexpected failure:", err));
 
   session.intervalId = setInterval(async () => {
     try {
@@ -750,7 +1003,7 @@ function startAutoRefresh(messages, trackerId, guild, initialData, initialHash, 
 
       // Fetches its own data and persists itemCounts internally (via withLinks), so
       // this tick never has to hold a stale in-memory links snapshot across these awaits.
-      await checkNewItemDms(data, guild, key);
+      await checkNewDms(data, guild, key);
 
       // No idle timeout — the loop (and item DMs with it) keeps running for as long as the
       // link exists, so opting into DMs doesn't silently stop working after an hour of quiet.
@@ -1172,14 +1425,40 @@ async function handleDmMenu(interaction, link) {
   });
 }
 
+// Switches which kind's picker is shown (see buildDmSlotRows). It's a plain view change, no
+// dmSlotSettings write, so this doesn't need the withLinks lock or a rebaseline check.
+async function handleDmTabSwitch(interaction) {
+  const [, , kind, ...pageParts] = interaction.customId.split(":");
+  const pages = decodeDmPages(pageParts);
+  const key   = linkKey(interaction.guildId, interaction.channelId);
+  const link  = loadLinks()[key];
+
+  if (!link) return notLinkedUpdate(interaction);
+
+  await interaction.deferUpdate();
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${link.trackerId}`);
+  } catch (err) {
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
+  }
+
+  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
+
+  await interaction.editReply({
+    embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
+    components: buildDmMenuRows(link, interaction.user.id, ownedGames, kind, pages),
+  });
+}
+
 // Per-game toggles from a StringSelectMenu — only ever reachable when the kind isn't currently
 // "all" (the select is disabled otherwise). The select doesn't track "checked" state (see
 // buildDmSlotRows), so each submitted value is a flip: on->off or off->on. Games not picked are
 // left exactly as they were, on any page.
 async function handleDmSlotSelect(interaction) {
-  const [, , kind, pageStr, otherPageStr] = interaction.customId.split(":");
-  const page      = parseInt(pageStr, 10);
-  const otherPage = parseInt(otherPageStr, 10);
+  const [, , kind, ...pageParts] = interaction.customId.split(":");
+  const pages = decodeDmPages(pageParts);
   const key  = linkKey(interaction.guildId, interaction.channelId);
   const link = loadLinks()[key];
 
@@ -1198,7 +1477,7 @@ async function handleDmSlotSelect(interaction) {
 
   const freshLink = await withLinks(async freshLinks => {
     const l = freshLinks[key];
-    await rebaselineItemCountsIfFirstOptIn(l, data);
+    await rebaselineDmBaselinesIfFirstOptIn(l, data);
     l.dmSlotSettings ??= {};
     l.dmSlotSettings[interaction.user.id] ??= {};
     const prevSetting = l.dmSlotSettings[interaction.user.id][kind];
@@ -1217,19 +1496,15 @@ async function handleDmSlotSelect(interaction) {
 
   await interaction.editReply({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
-    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, {
-      progression: kind === "progression" ? page : otherPage,
-      useful:      kind === "useful" ? page : otherPage,
-    }),
+    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, kind, pages),
   });
 }
 
 // Dedicated Enable All / Disable All button — a single unconditional action, so there's no
 // ambiguity with whatever the per-game select happens to show.
 async function handleDmSlotAllToggle(interaction) {
-  const [, , kind, action, pageStr, otherPageStr] = interaction.customId.split(":");
-  const page      = parseInt(pageStr, 10);
-  const otherPage = parseInt(otherPageStr, 10);
+  const [, , kind, action, ...pageParts] = interaction.customId.split(":");
+  const pages = decodeDmPages(pageParts);
   const key  = linkKey(interaction.guildId, interaction.channelId);
   const link = loadLinks()[key];
 
@@ -1246,7 +1521,7 @@ async function handleDmSlotAllToggle(interaction) {
 
   const freshLink = await withLinks(async freshLinks => {
     const l = freshLinks[key];
-    await rebaselineItemCountsIfFirstOptIn(l, data);
+    await rebaselineDmBaselinesIfFirstOptIn(l, data);
     l.dmSlotSettings ??= {};
     l.dmSlotSettings[interaction.user.id] ??= {};
     l.dmSlotSettings[interaction.user.id][kind] = action === "on" ? "all" : [];
@@ -1257,17 +1532,13 @@ async function handleDmSlotAllToggle(interaction) {
 
   await interaction.editReply({
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
-    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, {
-      progression: kind === "progression" ? page : otherPage,
-      useful:      kind === "useful" ? page : otherPage,
-    }),
+    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, kind, pages),
   });
 }
 
 async function handleDmSlotPageButton(interaction) {
-  const [, , kind, dir, pageStr, otherPageStr] = interaction.customId.split(":");
-  const fromPage  = parseInt(pageStr, 10);
-  const otherPage = parseInt(otherPageStr, 10);
+  const [, , kind, dir, ...pageParts] = interaction.customId.split(":");
+  const pages = decodeDmPages(pageParts);
   const key      = linkKey(interaction.guildId, interaction.channelId);
   const link     = loadLinks()[key];
 
@@ -1282,15 +1553,12 @@ async function handleDmSlotPageButton(interaction) {
     return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
   }
 
-  const newPage       = dir === "n" ? fromPage + 1 : fromPage - 1;
+  pages[kind] = dir === "n" ? pages[kind] + 1 : pages[kind] - 1;
   const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
 
   await interaction.editReply({
     embeds: [buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
-    components: buildDmMenuRows(link, interaction.user.id, ownedGames, {
-      progression: kind === "progression" ? newPage : otherPage,
-      useful:      kind === "useful" ? newPage : otherPage,
-    }),
+    components: buildDmMenuRows(link, interaction.user.id, ownedGames, kind, pages),
   });
 }
 
@@ -1373,11 +1641,14 @@ async function handleLinkModeButton(interaction, mode, trackerId) {
   });
 
   try {
-    const data     = await ctGet(`/tracker/${trackerId}`);
-    const baseline = await computeItemCountBaseline(data);
-    if (baseline) {
+    const data      = await ctGet(`/tracker/${trackerId}`);
+    const baselines = await computeDmBaselines(data);
+    if (baselines) {
       await withLinks(links => {
-        if (links[key]) links[key].itemCounts = baseline;
+        if (links[key]) {
+          links[key].itemCounts = baselines.itemCounts;
+          links[key].hintKeys   = baselines.hintKeys;
+        }
       });
     }
   } catch (err) {
@@ -1548,7 +1819,7 @@ async function handleHelp(interaction) {
           "Opens the bot menu for this channel:\n" +
           "- **Status** — preview tracker status with a **Post to channel** button.\n" +
           "- **Register** / **Unregister** — add or remove yourself from the registered view (only shown once the channel's view mode is **Registered Only**).\n" +
-          "- **DM Notifications** — opens a submenu with a dropdown per item kind (**Progression**, **Useful**). Picking a game in the dropdown toggles it on/off (its description shows current state); the dropdown's own label shows how many are on. **Enable All** covers the whole roster, including games added later; the dropdown is disabled while that's on — hit **Disable All** first to pick individually.\n" +
+          "- **DM Notifications**: choose which games send you a DM for **Progression** items, **Useful** items, or **Hints**. Turn games on/off one at a time, or use **Enable All** / **Disable All** for a whole tab at once.\n" +
           "- **Admin Actions** *(Manage Channels only)* — link/unlink this channel's tracker, switch view mode between **Show All** and **Registered Only**, or register another player.",
       },
       { name: "`/help`", value: "Show this message." },
@@ -1669,6 +1940,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("post:"))            return await handlePostButton(interaction);
       if (interaction.customId.startsWith("menu:dmslotpage:")) return await handleDmSlotPageButton(interaction);
       if (interaction.customId.startsWith("menu:dmslotall:"))  return await handleDmSlotAllToggle(interaction);
+      if (interaction.customId.startsWith("menu:dmtab:"))      return await handleDmTabSwitch(interaction);
       if (interaction.customId.startsWith("menu:"))            return await handleMenuButton(interaction);
     }
     if (interaction.isModalSubmit()) {
