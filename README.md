@@ -42,11 +42,11 @@ Open `bot/archeesepelago.conf`, fill in the two values, then double-click `bot/r
 
 - **Status** *(Everyone)*: shows a status preview, with **Prev/Next** page buttons (for big rooms) and a **Post to channel** button to publish it.
 - **Register** / **Unregister** *(Everyone, only shown when the channel's view mode is Registered Only)*: adds/removes you from the channel's **Registered Only** view.
-- **DM Notifications** *(Everyone)*: choose which games send you a DM. There are three tabs, **Progression**, **Useful**, and **Hints**, each with a dropdown to turn individual games on/off, plus an **Enable All** / **Disable All** button.
+- **DM Notifications** *(Everyone)*: choose which games send you a DM. There are two tabs, **Progression** and **Useful**, each with a dropdown to turn individual games on/off, plus an **Enable All** / **Disable All** button.
 
   **Progression** and **Useful** DMs tell you when you receive an important item from someone else's world. Items you find yourself don't count.
 
-  **Hints** DMs tell you about hints on Progression or Useful items only: either "here's where your item is hiding" (in someone else's game) or "someone's item was just found hiding in your game." You won't get a DM for junk/trap items, hints about things you already know, or hints about your own stuff in your own game.
+  Each tab also has an **Enable/Disable Hints** button. Turning it on sends you a DM for hints on that item type, either "here's where your item is hiding" (in someone else's game) or "someone's item was just found hiding in your game," and it applies across **all** of your games in this tracker, not just the ones toggled on above, since a hint can be about a game you haven't picked for item DMs, and it affects other players either way. You won't get a DM for junk/trap items, hints about things you already know, or hints about your own stuff in your own game.
 - **Admin Actions** *(Manage Channels)*: opens a submenu:
   - **Link Tracker** / **Update Tracker**: opens a modal for a CheeseTrackers URL or bare tracker ID, then a mode picker (**Show All** / **Registered Only**) to finish linking. Re-linking an already-linked channel updates it.
   - **Unlink Channel**: removes the channel's link (with a confirmation step) and stops auto-refresh.
