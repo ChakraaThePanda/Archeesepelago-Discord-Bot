@@ -35,11 +35,14 @@ const LINKS_FILE    = path.join(__dirname, "links.json");
 // Structure: { "<guildId>:<channelId>": { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?,
 //   lastActivityAt?, dmSlotSettings?, itemCounts?, hintKeys? } }
 // dmSlotSettings: { [discordUserId]: { progression?: "all" | apPlayerPosition[], useful?: "all" | apPlayerPosition[],
-//   hint?: "all" | apPlayerPosition[] } }
-// This is per-user, per-slot opt-in to Progression / Useful item DMs and Hint Received DMs for this
+//   hintProgression?: boolean, hintUseful?: boolean } }
+// progression/useful are per-user, per-slot opt-in to Progression / Useful item DMs for this
 // channel's tracker. "all" means every slot the user owns, including ones added to the room later;
 // an array is an explicit subset of AP player positions. A kind absent from a user's entry means
 // DMs are off for it.
+// hintProgression/hintUseful are plain on/off toggles for Hint Received DMs, applying to every
+// game the user owns (not just the slots selected above for progression/useful item DMs) since a
+// hint can be about a game the user hasn't picked for item DMs at all.
 // itemCounts: { [apPlayerPosition]: lastSeenItemCount } — used to detect new items only. Shared
 // baseline for both progression and useful DMs, since it just tracks total items received (it's
 // not "progression-only" despite the field's old name).
@@ -350,7 +353,7 @@ async function checkNewDms(data, guild, key) {
       const member = memberByUsername.get(game.effective_discord_username.toLowerCase());
       if (!member) continue;
       const dmSetting = link.dmSlotSettings[member.id];
-      if (!dmSetting || !isSlotSelected(dmSetting.hint, position)) continue;
+      if (!dmSetting || (!dmSetting.hintProgression && !dmSetting.hintUseful)) continue;
 
       // This position's own checksum doubles as the item namespace when it's the receiving
       // player (its item's id space) and as the location namespace when it's the finding player
@@ -364,11 +367,15 @@ async function checkNewDms(data, guild, key) {
         // outcome is already old news, so a DM about it would be redundant.
         if (found) continue;
 
-        // Only Progression and Useful items are worth a hint DM. Filler and Trap aren't
+        // Only Progression and Useful items are worth a hint DM, each gated by its own toggle
+        // (hintProgression/hintUseful), applying across every game the user owns regardless of
+        // that game's progression/useful item-DM selection above. Filler and Trap aren't
         // interesting enough to notify about either way. Uses the same classification the embed
         // itself displays, so an item never gets excluded here yet still shown as "Progression"
         // in a DM that did go out (or vice versa).
         const classification = classifyItemFlags(itemFlags);
+        if (classification === "Progression" && !dmSetting.hintProgression) continue;
+        if (classification === "Useful" && !dmSetting.hintUseful) continue;
         if (classification !== "Progression" && classification !== "Useful") continue;
 
         if (receivingPlayer === position && findingPlayer !== position) {
@@ -731,9 +738,11 @@ function buildMenuEmbed(link, userId, isManager, ownedPositions = null) {
     lines.push(isRegistered ? "You Are: ✅ **Registered**" : "You Are: ❌ **Not Registered**");
   }
 
-  lines.push(`Progression Item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.progression, ownedPositions)}`);
-  lines.push(`Useful Item DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.useful, ownedPositions)}`);
-  lines.push(`Hints DMs: ${dmSettingSummary(link.dmSlotSettings?.[userId]?.hint, ownedPositions)}`);
+  const dmSetting = link.dmSlotSettings?.[userId];
+  lines.push(`Progression Item DMs: ${dmSettingSummary(dmSetting?.progression, ownedPositions)}`);
+  lines.push(`Progression Hints: ${dmSetting?.hintProgression ? "✅ **On** (all games)" : "❌ **Off**"}`);
+  lines.push(`Useful Item DMs: ${dmSettingSummary(dmSetting?.useful, ownedPositions)}`);
+  lines.push(`Useful Hints: ${dmSetting?.hintUseful ? "✅ **On** (all games)" : "❌ **Off**"}`);
 
   e.setDescription(lines.join("\n"));
   return e;
@@ -777,14 +786,17 @@ function buildMainMenuRows(interaction, link) {
 
 const DM_SLOTS_PER_PAGE = 25; // Discord's per-select option cap
 
-// The three opt-in DM kinds, and the order they're tabbed through in the menu.
-const DM_KINDS = ["progression", "useful", "hint"];
-const DM_KIND_LABELS = { progression: "Progression", useful: "Useful", hint: "Hints" };
+// The two opt-in item-DM kinds, and the order they're tabbed through in the menu. Hint DMs are
+// no longer their own tab/kind, since each tab now carries its own "Enable/Disable {kind} Hints"
+// toggle instead (see buildDmSlotRows), stored as hintProgression/hintUseful.
+const DM_KINDS = ["progression", "useful"];
+const DM_KIND_LABELS = { progression: "Progression", useful: "Useful" };
+const HINT_FLAG_KEY = { progression: "hintProgression", useful: "hintUseful" };
 
 // Only one kind's picker (select + controls) is ever shown at a time, since a message caps out at 5
-// action rows, and 3 kinds' worth of select+controls (2 rows each) plus a tab row and a back
-// button would need 8. Each kind still keeps its own page position across tab switches, so the
-// customId threads all three page numbers through regardless of which kind is currently active.
+// action rows, and both kinds' worth of select+controls (2 rows each) plus a tab row and a back
+// button would need 6. Each kind still keeps its own page position across tab switches, so the
+// customId threads both page numbers through regardless of which kind is currently active.
 function encodeDmPages(pages) {
   return DM_KINDS.map(k => pages[k] ?? 0).join(":");
 }
@@ -817,7 +829,8 @@ function buildDmTabRow(activeKind, pages) {
 // "every game listed one by one" clutter this avoids. Instead the placeholder itself carries a
 // live count, and each option's description (not its checked state) shows current on/off — so
 // picking an option here toggles that one game rather than replacing the page's whole selection.
-function buildDmSlotRows(kind, ownedGames, setting, pages) {
+function buildDmSlotRows(kind, ownedGames, dmSetting, pages) {
+  const setting     = dmSetting[kind];
   const isAll       = setting === "all";
   const totalPages  = Math.max(1, Math.ceil(ownedGames.length / DM_SLOTS_PER_PAGE));
   const clampedPage = Math.max(0, Math.min(pages[kind] ?? 0, totalPages - 1));
@@ -849,10 +862,18 @@ function buildDmSlotRows(kind, ownedGames, setting, pages) {
       )
     );
 
+  // Hint DMs for this kind (see HINT_FLAG_KEY) are a single on/off toggle applying to every game
+  // the user owns, not the per-game picker above, since a hint can be about a game the user hasn't
+  // selected for item DMs at all, and hints affect other players so they shouldn't be silently
+  // scoped down to a subset of games.
+  const hintOn = Boolean(dmSetting[HINT_FLAG_KEY[kind]]);
   const controls = [
     isAll
       ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off:${encoded}`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
       : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on:${encoded}`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
+    hintOn
+      ? new ButtonBuilder().setCustomId(`menu:dmhint:${kind}:off:${encoded}`).setLabel(`Disable ${label} Hints`).setStyle(ButtonStyle.Danger)
+      : new ButtonBuilder().setCustomId(`menu:dmhint:${kind}:on:${encoded}`).setLabel(`Enable ${label} Hints`).setStyle(ButtonStyle.Success),
   ];
   if (totalPages > 1) {
     controls.push(
@@ -869,9 +890,9 @@ function buildDmSlotRows(kind, ownedGames, setting, pages) {
 
 // Takes ownedGames rather than fetching it, so callers can reuse the same fetch for the embed's
 // accurate DM-count lines (see dmSettingSummary) instead of resolving guild membership twice.
-// `activeKind` picks which of the 3 kinds' picker is currently shown (see buildDmSlotRows).
-// `pages` pins each kind's own page (e.g. { progression: 1, useful: 0, hint: 0 }) so switching
-// tabs or paging one kind doesn't bounce the others back to page 0 when the menu re-renders.
+// `activeKind` picks which of the 2 kinds' picker is currently shown (see buildDmSlotRows).
+// `pages` pins each kind's own page (e.g. { progression: 1, useful: 0 }) so switching tabs or
+// paging one kind doesn't bounce the other back to page 0 when the menu re-renders.
 function buildDmMenuRows(link, userId, ownedGames, activeKind = "progression", pages = {}) {
   if (!ownedGames.length) {
     return [
@@ -885,7 +906,7 @@ function buildDmMenuRows(link, userId, ownedGames, activeKind = "progression", p
   const settings = link.dmSlotSettings?.[userId] ?? {};
   const rows = [
     buildDmTabRow(activeKind, pages),
-    ...buildDmSlotRows(activeKind, ownedGames, settings[activeKind], pages),
+    ...buildDmSlotRows(activeKind, ownedGames, settings, pages),
     backToMenuRow(),
   ];
   return rows;
@@ -1536,6 +1557,43 @@ async function handleDmSlotAllToggle(interaction) {
   });
 }
 
+// Enable/Disable {kind} Hints is a plain boolean toggle (see HINT_FLAG_KEY), unlike the per-game
+// progression/useful item-DM pickers this button sits next to. Applies to every game the user
+// owns since hints affect other players and shouldn't be silently scoped to a subset of games.
+async function handleDmHintToggle(interaction) {
+  const [, , kind, action, ...pageParts] = interaction.customId.split(":");
+  const pages = decodeDmPages(pageParts);
+  const key  = linkKey(interaction.guildId, interaction.channelId);
+  const link = loadLinks()[key];
+
+  if (!link) return notLinkedUpdate(interaction);
+
+  await interaction.deferUpdate();
+
+  let data;
+  try {
+    data = await ctGet(`/tracker/${link.trackerId}`);
+  } catch (err) {
+    return interaction.followUp({ content: `❌ Failed to fetch tracker data: ${err.message}`, flags: MessageFlags.Ephemeral });
+  }
+
+  const freshLink = await withLinks(async freshLinks => {
+    const l = freshLinks[key];
+    await rebaselineDmBaselinesIfFirstOptIn(l, data);
+    l.dmSlotSettings ??= {};
+    l.dmSlotSettings[interaction.user.id] ??= {};
+    l.dmSlotSettings[interaction.user.id][HINT_FLAG_KEY[kind]] = action === "on";
+    return l;
+  });
+
+  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, interaction.user.id);
+
+  await interaction.editReply({
+    embeds: [buildMenuEmbed(freshLink, interaction.user.id, hasManageChannels(interaction), ownedPositions)],
+    components: buildDmMenuRows(freshLink, interaction.user.id, ownedGames, kind, pages),
+  });
+}
+
 async function handleDmSlotPageButton(interaction) {
   const [, , kind, dir, ...pageParts] = interaction.customId.split(":");
   const pages = decodeDmPages(pageParts);
@@ -1819,7 +1877,7 @@ async function handleHelp(interaction) {
           "Opens the bot menu for this channel:\n" +
           "- **Status** — preview tracker status with a **Post to channel** button.\n" +
           "- **Register** / **Unregister** — add or remove yourself from the registered view (only shown once the channel's view mode is **Registered Only**).\n" +
-          "- **DM Notifications**: choose which games send you a DM for **Progression** items, **Useful** items, or **Hints**. Turn games on/off one at a time, or use **Enable All** / **Disable All** for a whole tab at once.\n" +
+          "- **DM Notifications**: choose which games send you a DM for **Progression** or **Useful** items. Turn games on/off one at a time, or use **Enable All** / **Disable All** for a whole tab at once. Each tab also has an **Enable/Disable Hints** button that turns on Hint Received DMs for that item type across all of your games.\n" +
           "- **Admin Actions** *(Manage Channels only)* — link/unlink this channel's tracker, switch view mode between **Show All** and **Registered Only**, or register another player.",
       },
       { name: "`/help`", value: "Show this message." },
@@ -1940,6 +1998,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("post:"))            return await handlePostButton(interaction);
       if (interaction.customId.startsWith("menu:dmslotpage:")) return await handleDmSlotPageButton(interaction);
       if (interaction.customId.startsWith("menu:dmslotall:"))  return await handleDmSlotAllToggle(interaction);
+      if (interaction.customId.startsWith("menu:dmhint:"))     return await handleDmHintToggle(interaction);
       if (interaction.customId.startsWith("menu:dmtab:"))      return await handleDmTabSwitch(interaction);
       if (interaction.customId.startsWith("menu:"))            return await handleMenuButton(interaction);
     }
