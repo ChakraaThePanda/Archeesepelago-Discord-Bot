@@ -588,21 +588,39 @@ const PROGRESSION_EMOJI = {
   soft_bk:   "🟡",
 };
 
-// Guild member cache — one fetch per guild per 5 min to avoid gateway opcode 8 rate limits
+// Guild member cache: one fetch per guild per 5 min to avoid gateway opcode 8 rate limits.
+// memberFetchInFlight dedupes concurrent callers (checkNewDms and buildStatusPages both call
+// this within the same auto-refresh tick) onto a single in-flight request instead of each
+// firing its own guild.members.fetch(). Failures are cached too (falling back to the Discord
+// client cache), otherwise a stretch of gateway timeouts/rate limits would retry a fresh
+// fetch(), and its opcode 8 request/listener, on every single call forever instead of backing
+// off for the TTL like a success does.
 const memberCacheMap = new Map();
+const memberFetchInFlight = new Map();
 const MEMBER_CACHE_TTL = 5 * 60 * 1000;
 
 async function fetchGuildMembers(guild) {
   const cached = memberCacheMap.get(guild.id);
   if (cached && Date.now() - cached.fetchedAt < MEMBER_CACHE_TTL) return cached.members;
-  try {
-    const members = await guild.members.fetch();
-    memberCacheMap.set(guild.id, { members, fetchedAt: Date.now() });
-    return members;
-  } catch (err) {
-    console.warn("[fetchGuildMembers] failed, using Discord cache:", err.message);
-    return guild.members.cache;
-  }
+
+  const inFlight = memberFetchInFlight.get(guild.id);
+  if (inFlight) return inFlight;
+
+  const promise = (async () => {
+    try {
+      const members = await guild.members.fetch();
+      memberCacheMap.set(guild.id, { members, fetchedAt: Date.now() });
+      return members;
+    } catch (err) {
+      console.warn("[fetchGuildMembers] failed, using Discord cache:", err.message);
+      memberCacheMap.set(guild.id, { members: guild.members.cache, fetchedAt: Date.now() });
+      return guild.members.cache;
+    } finally {
+      memberFetchInFlight.delete(guild.id);
+    }
+  })();
+  memberFetchInFlight.set(guild.id, promise);
+  return promise;
 }
 
 async function buildMemberByUsernameMap(guild) {
