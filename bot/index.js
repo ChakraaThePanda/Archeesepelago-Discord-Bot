@@ -434,17 +434,14 @@ async function checkNewDms(data, guild, key) {
     // description carries both the item name and the receiving slot (no separate "Received In"
     // field) so that identifying info still shows up in the notification itself, not just once
     // the DM is opened. Kind (progression/useful) is conveyed by color + author, no field needed.
-    // "Tracker" is still a field (matching the term used everywhere else in the bot: "Link
-    // Tracker", "this tracker"), placed last so it sits at the bottom of the embed.
+    // The tracker link lives on the title itself (setURL) rather than a separate "Tracker" field.
     const embed = new EmbedBuilder()
       .setColor(p.kind === "useful" ? USEFUL_DM_COLOR : PROGRESSION_DM_COLOR)
       .setAuthor({ name: p.kind === "useful" ? "Useful Item Received" : "Progression Item Received" })
       .setTitle(p.title)
+      .setURL(trackerUrl)
       .setDescription(`${itemName}\n${p.game.name} (${p.game.game})`)
-      .addFields(
-        { name: "Found by", value: senderLabel },
-        { name: "Tracker", value: `**[${p.title}](${trackerUrl})**` },
-      );
+      .addFields({ name: "Found by", value: senderLabel });
 
     try {
       await p.member.send({ embeds: [embed] });
@@ -481,7 +478,8 @@ async function checkNewDms(data, guild, key) {
     const embed = new EmbedBuilder()
       .setColor(HINT_DM_COLOR)
       .setAuthor({ name: "New Hint" })
-      .setTitle(p.title);
+      .setTitle(p.title)
+      .setURL(trackerUrl);
 
     if (p.scenario === "item") {
       embed.addFields(
@@ -494,7 +492,6 @@ async function checkNewDms(data, guild, key) {
         { name: "Their Item", value: `${itemLabel}\n${otherLabel}` },
       );
     }
-    embed.addFields({ name: "Tracker", value: `**[${p.title}](${trackerUrl})**` });
 
     try {
       await p.member.send({ embeds: [embed] });
