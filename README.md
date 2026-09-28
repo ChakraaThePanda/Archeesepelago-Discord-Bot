@@ -14,7 +14,7 @@ If you have any questions, add me on Discord: **Chakraa**
 
 ---
 
-### How to Use
+### Setup
 * Download the [latest version](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot/archive/refs/heads/main.zip) and extract it somewhere.
 * Create your Discord bot:
   1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**
