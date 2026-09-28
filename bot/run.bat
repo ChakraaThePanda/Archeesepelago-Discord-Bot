@@ -11,7 +11,7 @@ echo.
 :: ── Node.js check ────────────────────────────────────────────────────────────
 where node >nul 2>&1
 if %errorlevel% neq 0 (
-    :: Node not in PATH — check known install locations first (handles post-install PATH lag)
+    :: Node not in PATH. Check known install locations first (handles post-install PATH lag)
     if exist "%ProgramFiles%\nodejs\node.exe" (
         set "PATH=%ProgramFiles%\nodejs;%PATH%"
         goto node_ok
@@ -24,7 +24,7 @@ if %errorlevel% neq 0 (
     echo  [!] Node.js not found. Installing...
     echo.
 
-    :: Try winget via full path (Windows 10/11 — avoids PATH lookup issues)
+    :: Try winget via full path (Windows 10/11, avoids PATH lookup issues)
     set "WINGET=%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe"
     if exist "%WINGET%" (
         "%WINGET%" install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements
@@ -87,8 +87,8 @@ if %errorlevel% equ 0 (
     echo      Opening it for you now. Fill in the two values, save the file,
     echo      then press any key here to continue.
     echo.
-    echo        CT_API_KEY     - from your CheeseTrackers profile page
-    echo        DISCORD_TOKEN  - from discord.com/developers ^> your app ^> Bot
+    echo        CT_API_KEY:     from your CheeseTrackers profile page
+    echo        DISCORD_TOKEN:  from discord.com/developers ^> your app ^> Bot
     echo.
     start notepad archeesepelago.conf
     pause
