@@ -11,7 +11,6 @@ If you have any questions, add me on Discord: **Chakraa**
 * Item DMs: get a Discord DM when someone finds one of your Progression or Useful items
 * Hint DMs: get a DM when a hint involves one of your games
 * Registered Only view: for big rooms, only show the players who signed up
-* Players show up as Discord mentions when their CheeseTrackers name matches their Discord name
 
 ---
 
