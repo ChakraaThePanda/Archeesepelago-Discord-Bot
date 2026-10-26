@@ -1,0 +1,2 @@
+# Batch files need Windows line endings, including in the zip download
+*.bat text eol=crlf

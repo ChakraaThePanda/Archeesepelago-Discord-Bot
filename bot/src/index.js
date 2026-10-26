@@ -1,5 +1,7 @@
 const path = require("path");
-require("dotenv").config({ path: path.join(__dirname, "archeesepelago.conf"), quiet: true });
+const ROOT_DIR = path.join(__dirname, "..");
+const DATA_DIR = path.join(ROOT_DIR, "data");
+require("dotenv").config({ path: path.join(ROOT_DIR, "archeesepelago.conf"), quiet: true });
 
 const {
   Client,
@@ -21,7 +23,6 @@ const {
   ActivityType,
   MessageFlags,
 } = require("discord.js");
-const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 const fs = require("fs");
 
 // Prefixes every console line with the local date and time, so a warning in the console can
@@ -42,7 +43,8 @@ const CT_API_KEY        = process.env.CT_API_KEY;
 const DISCORD_TOKEN     = process.env.DISCORD_TOKEN;
 const CT_HOST           = "cheesetrackers.theincrediblewheelofchee.se";
 const BASE_URL          = `https://${CT_HOST}/api`;
-const LINKS_FILE        = path.join(__dirname, "links.json");
+const LINKS_FILE        = path.join(DATA_DIR, "links.json");
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const EMBED_COLOR       = 0xf5c542; // Every embed except DMs, which are colored by kind
 const BIG_WORLD_PLAYERS = 20;       // Player count that triggers the "use Registered Only" warning
@@ -156,13 +158,23 @@ function deleteCollectionEntry(guildId, channelId) {
 
 // ─── CT API ───────────────────────────────────────────────────────────────────
 
-// An HTTP error status from the CT or AP API. Like a node-fetch FetchError (DNS hiccup, dropped
-// connection), it's usually temporary, so callers retrying on a timer treat both as "try again
-// later" rather than a bug (see isTransientError).
+// An HTTP error status from the CT or AP API. Like a network failure (DNS hiccup, dropped
+// connection) or a timeout, it's usually temporary, so callers retrying on a timer treat all of
+// them as "try again later" rather than a bug (see isTransientError).
 class ApiError extends Error {}
 
 function isTransientError(err) {
-  return err instanceof ApiError || err.name === "FetchError";
+  return err instanceof ApiError
+    || err.name === "TimeoutError"                                  // AbortSignal.timeout fired
+    || (err instanceof TypeError && err.message === "fetch failed"); // network-level failure
+}
+
+// Every CT/AP request gives up after this long, so a stalled API can't hang a menu click or a
+// refresh tick indefinitely. The next refresh retries anyway.
+const API_TIMEOUT_MS = 30 * 1000;
+
+function apiFetch(url, options = {}) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(API_TIMEOUT_MS) });
 }
 
 // Consecutive transient failures per "<tag>:<key>", so timer-driven checks only log an outage
@@ -214,7 +226,7 @@ async function ctGet(endpoint) {
 // the user has to retry by clicking again. Any other failure still throws immediately, same as
 // before. This only smooths over the one failure mode that's directly tied to click volume.
 async function ctGetFresh(endpoint, attempt = 0) {
-  const res = await fetch(`${BASE_URL}${endpoint}`, { headers: ctHeaders() });
+  const res = await apiFetch(`${BASE_URL}${endpoint}`, { headers: ctHeaders() });
 
   if (res.status === 429 && attempt < 3) {
     const retryAfterMs = Number(res.headers.get("retry-after")) * 1000 || 500 * 2 ** attempt;
@@ -274,7 +286,7 @@ function deriveApTrackerInfo(upstreamUrl) {
 }
 
 async function apGet(origin, endpoint) {
-  const res = await fetch(`${origin}${endpoint}`);
+  const res = await apiFetch(`${origin}${endpoint}`);
   if (!res.ok) throw new ApiError(`Archipelago webhost API returned ${res.status}`);
   return res.json();
 }
@@ -788,10 +800,16 @@ async function getOwnedGames(guild, data, userId) {
   return { ownedGames: owned, ownedPositions: owned.map(g => g.position) };
 }
 
+// Rounded percentage that never shows 100 until every check is done.
+function percentDone(done, total) {
+  if (!total) return 0;
+  const pct = Math.round((done / total) * 100);
+  return pct === 100 && done < total ? 99 : pct;
+}
+
 function progressBar(done, total) {
   if (!total) return "0/0 (0%)";
-  const rawPct = Math.round((done / total) * 100);
-  const pct    = (rawPct === 100 && done < total) ? 99 : rawPct;
+  const pct    = percentDone(done, total);
   const filled = pct === 99 ? 7 : Math.round((done / total) * 8);
   return `${"█".repeat(filled)}${"░".repeat(8 - filled)} ${done}/${total} (${pct}%)`;
 }
@@ -813,19 +831,21 @@ function buildStatusNavRow(trackerId, page, totalPages) {
         .setDisabled(page >= totalPages - 1),
     );
   }
-  components.push(
-    new ButtonBuilder()
-      .setCustomId(`post:${trackerId}`)
-      .setLabel("Post to channel")
-      .setStyle(ButtonStyle.Primary),
-  );
+  components.push(postButton(`post:${trackerId}`));
   return new ActionRowBuilder().addComponents(...components);
 }
 
+function postButton(customId) {
+  return new ButtonBuilder().setCustomId(customId).setLabel("Post to channel").setStyle(ButtonStyle.Primary);
+}
+
+// "menu:back" returns to the main menu, "menu:admin" to Admin Actions.
+function backButton(customId = "menu:back") {
+  return new ButtonBuilder().setCustomId(customId).setLabel("◀ Back").setStyle(ButtonStyle.Secondary);
+}
+
 function backToMenuRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("menu:back").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
-  );
+  return new ActionRowBuilder().addComponents(backButton());
 }
 
 // ─── Menu (buttons) ───────────────────────────────────────────────────────────
@@ -1075,9 +1095,7 @@ function buildAdminMenuRows(link, collectionRoomId = null) {
       new ButtonBuilder().setCustomId("menu:admin:registeruser").setLabel("Register Someone").setStyle(ButtonStyle.Primary)
     ));
   }
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("menu:back").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
-  ));
+  rows.push(backToMenuRow());
   return rows;
 }
 
@@ -1356,8 +1374,7 @@ async function buildStatusPages(trackerId, data, guild, live = false, mode = "al
     for (const g of ownerGames) {
       const comp = COMPLETION_EMOJI[g.completion_status] ?? "";
       const prog = (g.completion_status === "done" || g.completion_status === "released") ? "" : (PROGRESSION_EMOJI[g.progression_status] ?? "❓");
-      const rawPct = g.checks_total ? Math.round((g.checks_done / g.checks_total) * 100) : 0;
-      const pct    = (rawPct === 100 && g.checks_done < g.checks_total) ? 99 : rawPct;
+      const pct      = percentDone(g.checks_done, g.checks_total);
       const safeName = (g.name ?? "").replace(/`/g, "ˋ") || "Unknown";
       const safeGame = (g.game ?? "").replace(/[`*]/g, (c) => c === "*" ? "\\*" : "ˋ") || "Unknown";
       blockLines.push(
@@ -1513,12 +1530,6 @@ function statusErrorReply(interaction, content) {
   return interaction.editReply({ content, embeds: [], components: [backToMenuRow()] });
 }
 
-function postButtonRow(customId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId).setLabel("Post to channel").setStyle(ButtonStyle.Primary)
-  );
-}
-
 // Stops the channel's refresh loop and marks its previous post (by stored message IDs, so this
 // also works for a post that wasn't resumed after a restart) as superseded.
 async function supersedeOldPost(channel, messageIds = []) {
@@ -1546,7 +1557,7 @@ async function handleCollectionStatus(interaction, roomId) {
   await interaction.editReply({
     content: null,
     embeds: [buildCollectionRoomEmbed(roomId, current)],
-    components: [postButtonRow(`postcr:${roomId}`), backToMenuRow()],
+    components: [new ActionRowBuilder().addComponents(postButton(`postcr:${roomId}`)), backToMenuRow()],
   });
 }
 
@@ -1886,7 +1897,7 @@ async function handleLinkModalSubmit(interaction) {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`menu:admin:linkmode:all:${trackerId}`).setLabel("Show All").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`menu:admin:linkmode:registered:${trackerId}`).setLabel("Registered Only").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("menu:admin").setLabel("◀ Back").setStyle(ButtonStyle.Secondary),
+    backButton("menu:admin"),
   );
 
   await interaction.editReply({
@@ -1947,6 +1958,9 @@ async function handleLinkModeButton(interaction, mode, trackerId) {
   const channel = interaction.channel;
   const key     = linkKey(interaction.guildId, channel.id);
 
+  // Ack first: retiring the old post edits every page, which can run past Discord's 3-second window.
+  await interaction.deferUpdate();
+
   // The new link starts without messageIds, so whatever is live in this channel (the old
   // tracker's post, or the collection room's) stops updating now. Left running, an old tracker's
   // loop would also diff its items against the new tracker's DM baselines.
@@ -1960,7 +1974,7 @@ async function handleLinkModeButton(interaction, mode, trackerId) {
     return { isUpdate: existed, freshLink: links[key] };
   });
 
-  await interaction.update({
+  await interaction.editReply({
     content: null,
     embeds: [buildMenuEmbed(freshLink, interaction.user.id, true)],
     components: buildAdminMenuRows(freshLink),
@@ -1990,10 +2004,12 @@ async function handleLinkModeButton(interaction, mode, trackerId) {
 }
 
 async function handleUnlinkConfirm(interaction) {
+  // Ack first: retiring the post edits every page, which can run past Discord's 3-second window.
+  await interaction.deferUpdate();
   await retireLivePost(interaction.channelId, STOPPED_NOTE);
   await deleteLinkEntry(interaction.guildId, interaction.channelId);
 
-  await interaction.update({
+  await interaction.editReply({
     embeds: [buildMenuEmbed(null, interaction.user.id, hasManageChannels(interaction))],
     components: buildMainMenuRows(interaction, null),
   });
@@ -2125,9 +2141,7 @@ async function handleMenuButton(interaction) {
     const selectRow = new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId("menu:admin:registeruser:select").setPlaceholder("Choose a user to register").setMinValues(1).setMaxValues(1)
     );
-    const backRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("menu:admin").setLabel("◀ Back").setStyle(ButtonStyle.Secondary)
-    );
+    const backRow = new ActionRowBuilder().addComponents(backButton("menu:admin"));
     return interaction.update({ embeds: [adminEmbed], components: [selectRow, backRow] });
   }
 

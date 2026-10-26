@@ -1,2 +1,5 @@
 node_modules/
-.claude
+.claude/
+
+# Runtime data (linked channels, log)
+bot/data/

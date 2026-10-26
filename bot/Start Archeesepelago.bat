@@ -69,6 +69,13 @@ if %errorlevel% neq 0 (
 
 :node_ok
 
+:: ── Migrate from older versions ───────────────────────────────────────────────
+:: links.json used to sit next to this file
+if exist "links.json" if not exist "data\links.json" (
+    if not exist "data" mkdir "data"
+    move "links.json" "data\links.json" >nul
+)
+
 :: ── Config check ──────────────────────────────────────────────────────────────
 if not exist "archeesepelago.conf" (
     echo  [!] archeesepelago.conf not found.
@@ -96,11 +103,11 @@ if %errorlevel% equ 0 (
 )
 
 :: ── Dependencies ─────────────────────────────────────────────────────────────
-if not exist "node_modules" (
+if not exist "src\node_modules" (
     echo  Installing dependencies ^(first run only^)...
     echo.
-    npm install --no-audit
-    if not exist "node_modules\discord.js" (
+    call npm install --no-audit --prefix src
+    if not exist "src\node_modules\discord.js" (
         echo.
         echo  [!] npm install failed. See errors above.
         echo.
@@ -115,9 +122,17 @@ if not exist "node_modules" (
 )
 
 :: ── Start ─────────────────────────────────────────────────────────────────────
+:: Runs in the system tray by default. Use "Start Archeesepelago.bat" console to run in this window instead.
+if /i not "%~1"=="console" if exist "src\tray.ps1" (
+    echo  Starting bot in the system tray...
+    echo  Right-click the tray icon to view the log, restart, or stop the bot.
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\tray.ps1" -Detach
+    exit /b
+)
+
 echo  Starting bot... ^(Ctrl+C to stop^)
 echo.
-node index.js
+node src\index.js
 set "NODE_EXIT=%errorlevel%"
 echo.
 echo  ============================================

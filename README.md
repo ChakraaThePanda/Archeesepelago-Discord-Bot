@@ -15,16 +15,28 @@ If you have any questions, add me on Discord: **Chakraa**
 ---
 
 ### Setup
-* Download the [latest version](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot/archive/refs/heads/main.zip) and extract it somewhere.
-* Create your Discord bot:
-  1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**
-  2. In **Bot**, click **Reset Token** and copy it. Also turn on **Server Members Intent** on that page.
-  3. In **OAuth2**, tick `bot` and `applications.commands`, then the **View Channels**, **Send Messages** and **Embed Links** permissions. Open the link it gives you to invite the bot to your server.
-* Get your CheeseTrackers API key: log in on [CheeseTrackers](https://cheesetrackers.theincrediblewheelofchee.se), click your profile and copy your API key.
-* Open `bot/archeesepelago.conf`, paste your bot token and API key, then double-click `bot/run.bat`. The first time, it installs everything it needs for you (a Windows permission popup may appear). If that fails, install [Node.js](https://nodejs.org/) yourself and run `run.bat` again.
+1. Download the [latest version](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot/archive/refs/heads/main.zip) and extract it somewhere.
+2. Create your Discord bot in the [Discord Developer Portal](https://discord.com/developers/applications):
+   * **New Application**, then in **Bot**, click **Reset Token** and copy it. Turn on **Server Members Intent** on that page too.
+   * In **OAuth2**, tick `bot` and `applications.commands`, then the **View Channels**, **Send Messages** and **Embed Links** permissions. Open the link it gives you to invite the bot to your server.
+3. Get your CheeseTrackers API key: log in on [CheeseTrackers](https://cheesetrackers.theincrediblewheelofchee.se), click your profile and copy it.
+4. Open `bot/archeesepelago.conf` and paste in your bot token and API key.
+5. Double-click `bot/Start Archeesepelago.bat`.
+
+The first start installs everything the bot needs (a Windows permission popup may appear). If that fails, install [Node.js](https://nodejs.org/) yourself and start it again.
+
+---
+
+### Running the bot
+The bot runs in the background, with its logo in the system tray next to the clock. Right-click the logo to **Show log**, **Restart bot** or **Stop bot and exit**. A red dot on the logo means the bot stopped; open the log to see why.
+
+* **Start with Windows**: press `Win + R`, type `shell:startup`, and put a shortcut to `Start Archeesepelago.bat` in that folder.
+* **Run in a window instead**: from a terminal in the `bot` folder, run `"Start Archeesepelago.bat" console`.
 
 #### Updating
-Extract the new version to a new folder, then copy `archeesepelago.conf` and `links.json` from your old `bot` folder into the new one. This keeps your settings and your linked channels.
+Extract the new version to a new folder, then copy `archeesepelago.conf` and the `data` folder from your old `bot` folder into the new one. This keeps your settings and your linked channels.
+
+Coming from a version without a `data` folder? Copy `links.json` instead of `data`; the bot moves it into place on its next start.
 
 ---
 
