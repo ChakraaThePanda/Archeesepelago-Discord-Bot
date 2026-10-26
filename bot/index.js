@@ -24,6 +24,18 @@ const {
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 const fs = require("fs");
 
+// Prefixes every console line with the local date and time, so a warning in the console can
+// be placed in time and its recurrence read off without any extra logging at the call sites.
+for (const level of ["log", "warn", "error"]) {
+  const original = console[level];
+  console[level] = (...args) => {
+    const d   = new Date();
+    const pad = n => String(n).padStart(2, "0");
+    const ts  = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    original(`[${ts}]`, ...args);
+  };
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CT_API_KEY        = process.env.CT_API_KEY;
@@ -701,7 +713,8 @@ const PROGRESSION_EMOJI = {
 // firing its own guild.members.fetch(). Failures are cached too (falling back to the Discord
 // client cache), otherwise a stretch of gateway timeouts/rate limits would retry a fresh
 // fetch(), and its opcode 8 request/listener, on every single call forever instead of backing
-// off for the TTL like a success does.
+// off for the TTL like a success does. Failures go through noteFailure so a guild whose fetch
+// keeps timing out warns once (and once more on recovery) instead of every refresh tick.
 const memberCacheMap = new Map();
 const memberFetchInFlight = new Map();
 const MEMBER_CACHE_TTL = 5 * 60 * 1000;
@@ -717,9 +730,10 @@ async function fetchGuildMembers(guild) {
     try {
       const members = await guild.members.fetch();
       memberCacheMap.set(guild.id, { members, fetchedAt: Date.now() });
+      noteSuccess("fetchGuildMembers", guild.id);
       return members;
     } catch (err) {
-      console.warn("[fetchGuildMembers] failed, using Discord cache:", err.message);
+      noteFailure("fetchGuildMembers", guild.id, err);
       memberCacheMap.set(guild.id, { members: guild.members.cache, fetchedAt: Date.now() });
       return guild.members.cache;
     } finally {
