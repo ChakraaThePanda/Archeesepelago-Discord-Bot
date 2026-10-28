@@ -123,10 +123,10 @@ if not exist "src\node_modules" (
 
 :: ── Start ─────────────────────────────────────────────────────────────────────
 :: Runs in the system tray by default. Use "Start Archeesepelago.bat" console to run in this window instead.
-if /i not "%~1"=="console" if exist "src\tray.ps1" (
+if /i not "%~1"=="console" if exist "src\archeesepelago_tray.ps1" (
     echo  Starting bot in the system tray...
     echo  Right-click the tray icon to view the log, restart, or stop the bot.
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\tray.ps1" -Detach
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\archeesepelago_tray.ps1" -Detach
     exit /b
 )
 
