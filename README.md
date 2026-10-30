@@ -1,7 +1,7 @@
 # Archeesepelago-Discord-Bot
 A simple Discord bot that shows your [Archipelago](https://archipelago.gg) room's progress from [CheeseTrackers](https://cheesetrackers.theincrediblewheelofchee.se) right in a Discord channel.
 
-If you have any questions, add me on Discord: **Chakraa**
+If you have any questions, join my Discord server: [Chakraa's Projects](https://discord.gg/bkk4nVXcjm)
 
 ---
 
@@ -53,3 +53,9 @@ Type `/menu` in a channel to open the bot's menu, or `/help` for a quick overvie
 | ✅ All checks | 🎯 Goal | 🟢 Unblocked | 🔴 BK |
 | 🏁 Done | 💀 Released | 🚀 Go Mode | 🟡 Soft BK |
 | | | ❓ Unknown | |
+
+---
+
+### Questions or feedback?
+
+Need help, found a bug, or have an idea? Join my Discord server, [Chakraa's Projects](https://discord.gg/bkk4nVXcjm), and post in this project's channel.
