@@ -1370,7 +1370,9 @@ async function buildStatusPages(trackerId, data, guild, live = false, mode = "al
       const member = memberByUsername.get(ownerKey);
       if (!member || !registeredSet.has(member.id)) continue;
     }
-    const blockLines = [`- **${label}**`];
+    let ownerDone = 0, ownerAll = 0;
+    for (const g of ownerGames) { ownerDone += g.checks_done; ownerAll += g.checks_total; }
+    const blockLines = [`- **${label}** · ${ownerDone}/${ownerAll} (${percentDone(ownerDone, ownerAll)}%)`];
     for (const g of ownerGames) {
       const comp = COMPLETION_EMOJI[g.completion_status] ?? "";
       const prog = (g.completion_status === "done" || g.completion_status === "released") ? "" : (PROGRESSION_EMOJI[g.progression_status] ?? "❓");
