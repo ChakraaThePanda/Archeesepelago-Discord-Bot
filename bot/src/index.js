@@ -22,6 +22,9 @@ const {
   PermissionFlagsBits,
   ActivityType,
   MessageFlags,
+  Partials,
+  InteractionContextType,
+  ApplicationIntegrationType,
 } = require("discord.js");
 const fs = require("fs");
 
@@ -156,6 +159,37 @@ function deleteCollectionEntry(guildId, channelId) {
   return withLinks(links => { if (collectionRoomOf(links, key)) delete links[key]; });
 }
 
+// ─── DM runs (storage) ────────────────────────────────────────────────────────
+// Runs a user set up in DMs with the bot live under "dm:<userId>", a key no server channel's
+// "<guildId>:<channelId>" can ever match: { dmRuns: { [trackerId]: run } }. A run is shaped like a
+// tracker link ({ trackerId, title, addedAt, lastActivityAt?, dmSlotSettings?, itemCounts?,
+// hintKeys? }), with dmSlotSettings only ever holding its owner, so the notification code works on
+// it unchanged. Server code never touches these entries: its lookups all go through a channel key,
+// and the resume loops skip entries with neither a trackerId nor a collectionRoom.
+const MAX_DM_RUNS = 25; // one select menu's worth of options
+
+function dmUserKey(userId) {
+  return `dm:${userId}`;
+}
+
+function dmRunOf(links, userId, trackerId) {
+  const runs = links[dmUserKey(userId)]?.dmRuns;
+  return runs && Object.hasOwn(runs, trackerId) ? runs[trackerId] : undefined;
+}
+
+function dmRunsOf(links, userId) {
+  return Object.values(links[dmUserKey(userId)]?.dmRuns ?? {});
+}
+
+function isDmKindOn(setting) {
+  return setting === "all" || (Array.isArray(setting) && setting.length > 0);
+}
+
+// Whether a dmSlotSettings entry has any notification turned on.
+function hasAnyDmSetting(s) {
+  return Boolean(s) && (isDmKindOn(s.progression) || isDmKindOn(s.useful) || Boolean(s.hintProgression) || Boolean(s.hintUseful));
+}
+
 // ─── CT API ───────────────────────────────────────────────────────────────────
 
 // An HTTP error status from the CT or AP API. Like a network failure (DNS hiccup, dropped
@@ -165,8 +199,10 @@ class ApiError extends Error {}
 
 function isTransientError(err) {
   return err instanceof ApiError
-    || err.name === "TimeoutError"                                  // AbortSignal.timeout fired
-    || (err instanceof TypeError && err.message === "fetch failed"); // network-level failure
+    || err.name === "TimeoutError"                // AbortSignal.timeout fired
+    || (err instanceof TypeError
+      && (err.message === "fetch failed"          // connection failed before a response
+        || err.message === "terminated"));        // connection dropped while reading the response
 }
 
 // Every CT/AP request gives up after this long, so a stalled API can't hang a menu click or a
@@ -343,8 +379,10 @@ function hintKeyOf(hint) {
 // withLinks, right before persisting, since the network fetches below all happen before that lock is
 // taken, so this never holds up other menu actions for longer than the synchronous diff. Never
 // throws; failures are logged and treated as "no update".
-async function checkNewDms(data, guild, key) {
-  const peek = trackerLinkOf(loadLinks(), key);
+// `scope` is whose slots can be resolved to a Discord user (see buildMemberByUsernameMap), and
+// `lookup` finds the link in the links file: a channel's tracker link by default, or a DM run.
+async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(links, key)) {
+  const peek = lookup(loadLinks());
   if (!peek?.dmSlotSettings || !Object.keys(peek.dmSlotSettings).length) return;
 
   let apInfo;
@@ -360,7 +398,7 @@ async function checkNewDms(data, guild, key) {
     [trackerData, staticData, memberByUsername] = await Promise.all([
       apGet(apInfo.origin, `/api/tracker/${apInfo.apTrackerId}`),
       apGet(apInfo.origin, `/api/static_tracker/${apInfo.apTrackerId}`),
-      buildMemberByUsernameMap(guild),
+      buildMemberByUsernameMap(scope),
     ]);
   } catch (err) {
     // The AP webhost times out now and then, and the next refresh retries anyway.
@@ -387,7 +425,7 @@ async function checkNewDms(data, guild, key) {
   const pendingHints = [];
 
   await withLinks(links => {
-    const link = trackerLinkOf(links, key);
+    const link = lookup(links);
     if (!link?.dmSlotSettings || !Object.keys(link.dmSlotSettings).length) return;
 
     if (!link.itemCounts) link.itemCounts = {};
@@ -756,8 +794,16 @@ async function fetchGuildMembers(guild) {
   return promise;
 }
 
-async function buildMemberByUsernameMap(guild) {
-  const members = await fetchGuildMembers(guild);
+// Maps every lowercased Discord name a CheeseTrackers slot could be claimed under to its owner.
+// `scope` is a server (every member, by username, display name or nickname) or, for a DM run, the
+// one User it belongs to, so only their own slots resolve and everyone else shows by CT name.
+async function buildMemberByUsernameMap(scope) {
+  if (!scope.members) {
+    const userMap = new Map([[scope.username.toLowerCase(), scope]]);
+    if (scope.globalName) userMap.set(scope.globalName.toLowerCase(), scope);
+    return userMap;
+  }
+  const members = await fetchGuildMembers(scope);
   const memberByUsername = new Map();
   for (const [, member] of members) {
     memberByUsername.set(member.user.username.toLowerCase(), member);
@@ -788,8 +834,8 @@ function isSlotSelected(setting, position) {
 // Discord owner (case-insensitive username/global name/nickname). Every call site needs both the
 // full game objects (to render) and the bare positions (to cross-reference stored settings), so
 // this returns both from the one fetch rather than making callers re-derive positions themselves.
-async function getOwnedGames(guild, data, userId) {
-  const memberByUsername = await buildMemberByUsernameMap(guild);
+async function getOwnedGames(scope, data, userId) {
+  const memberByUsername = await buildMemberByUsernameMap(scope);
   const owned = [];
   for (const g of data.games ?? []) {
     if (!g.effective_discord_username) continue;
@@ -844,8 +890,14 @@ function backButton(customId = "menu:back") {
   return new ButtonBuilder().setCustomId(customId).setLabel("◀ Back").setStyle(ButtonStyle.Secondary);
 }
 
-function backToMenuRow() {
-  return new ActionRowBuilder().addComponents(backButton());
+function backToMenuRow(customId = "menu:back") {
+  return new ActionRowBuilder().addComponents(backButton(customId));
+}
+
+// Back to the start of whichever menu this interaction came from: the channel menu in a server,
+// the run picker in DMs.
+function backToStartRow(interaction) {
+  return backToMenuRow(interaction.guildId ? "menu:back" : "dm:home");
 }
 
 // ─── Menu (buttons) ───────────────────────────────────────────────────────────
@@ -901,14 +953,19 @@ function buildMenuEmbed(link, userId, isManager, ownedPositions = null, collecti
     lines.push(isRegistered ? "You Are: ✅ **Registered**" : "You Are: ❌ **Not Registered**");
   }
 
-  const dmSetting = link.dmSlotSettings?.[userId];
-  lines.push(`Progression Item DMs: ${dmSettingSummary(dmSetting?.progression, ownedPositions)}`);
-  lines.push(`Progression Hints: ${dmSetting?.hintProgression ? "✅ **On** (all games)" : "❌ **Off**"}`);
-  lines.push(`Useful Item DMs: ${dmSettingSummary(dmSetting?.useful, ownedPositions)}`);
-  lines.push(`Useful Hints: ${dmSetting?.hintUseful ? "✅ **On** (all games)" : "❌ **Off**"}`);
-
+  lines.push(...dmSettingLines(link.dmSlotSettings?.[userId], ownedPositions));
   e.setDescription(lines.join("\n"));
   return e;
+}
+
+// One summary line per notification kind, for the channel menu and a DM run's menu.
+function dmSettingLines(dmSetting, ownedPositions = null) {
+  return [
+    `Progression Item DMs: ${dmSettingSummary(dmSetting?.progression, ownedPositions)}`,
+    `Progression Hints: ${dmSetting?.hintProgression ? "✅ **On** (all games)" : "❌ **Off**"}`,
+    `Useful Item DMs: ${dmSettingSummary(dmSetting?.useful, ownedPositions)}`,
+    `Useful Hints: ${dmSetting?.hintUseful ? "✅ **On** (all games)" : "❌ **Off**"}`,
+  ];
 }
 
 // One row instead of one-button-per-row. Discord allows up to 5 buttons per action row, and
@@ -970,12 +1027,12 @@ function decodeDmPages(parts) {
   return pages;
 }
 
-function buildDmTabRow(activeKind, pages) {
+function buildDmTabRow(activeKind, pages, prefix = "menu") {
   const encoded = encodeDmPages(pages);
   return new ActionRowBuilder().addComponents(
     ...DM_KINDS.map(k =>
       new ButtonBuilder()
-        .setCustomId(`menu:dmtab:${k}:${encoded}`)
+        .setCustomId(`${prefix}:dmtab:${k}:${encoded}`)
         .setLabel(DM_KIND_LABELS[k])
         .setStyle(k === activeKind ? ButtonStyle.Primary : ButtonStyle.Secondary)
     )
@@ -992,7 +1049,7 @@ function buildDmTabRow(activeKind, pages) {
 // "every game listed one by one" clutter this avoids. Instead the placeholder itself carries a
 // live count, and each option's description (not its checked state) shows current on/off, so
 // picking an option here toggles that one game rather than replacing the page's whole selection.
-function buildDmSlotRows(kind, ownedGames, dmSetting, pages) {
+function buildDmSlotRows(kind, ownedGames, dmSetting, pages, prefix = "menu") {
   const setting     = dmSetting[kind];
   const isAll       = setting === "all";
   const totalPages  = Math.max(1, Math.ceil(ownedGames.length / DM_SLOTS_PER_PAGE));
@@ -1011,7 +1068,7 @@ function buildDmSlotRows(kind, ownedGames, dmSetting, pages) {
   const encoded = encodeDmPages({ ...pages, [kind]: clampedPage });
 
   const select = new StringSelectMenuBuilder()
-    .setCustomId(`menu:dmslot:${kind}:${encoded}`)
+    .setCustomId(`${prefix}:dmslot:${kind}:${encoded}`)
     .setPlaceholder(placeholder)
     .setDisabled(isAll)
     .setMinValues(0)
@@ -1032,16 +1089,16 @@ function buildDmSlotRows(kind, ownedGames, dmSetting, pages) {
   const hintOn = Boolean(dmSetting[HINT_FLAG_KEY[kind]]);
   const controls = [
     isAll
-      ? new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:off:${encoded}`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
-      : new ButtonBuilder().setCustomId(`menu:dmslotall:${kind}:on:${encoded}`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
+      ? new ButtonBuilder().setCustomId(`${prefix}:dmslotall:${kind}:off:${encoded}`).setLabel(`Disable All ${label}`).setStyle(ButtonStyle.Danger)
+      : new ButtonBuilder().setCustomId(`${prefix}:dmslotall:${kind}:on:${encoded}`).setLabel(`Enable All ${label}`).setStyle(ButtonStyle.Success),
     hintOn
-      ? new ButtonBuilder().setCustomId(`menu:dmhint:${kind}:off:${encoded}`).setLabel(`Disable ${label} Hints`).setStyle(ButtonStyle.Danger)
-      : new ButtonBuilder().setCustomId(`menu:dmhint:${kind}:on:${encoded}`).setLabel(`Enable ${label} Hints`).setStyle(ButtonStyle.Success),
+      ? new ButtonBuilder().setCustomId(`${prefix}:dmhint:${kind}:off:${encoded}`).setLabel(`Disable ${label} Hints`).setStyle(ButtonStyle.Danger)
+      : new ButtonBuilder().setCustomId(`${prefix}:dmhint:${kind}:on:${encoded}`).setLabel(`Enable ${label} Hints`).setStyle(ButtonStyle.Success),
   ];
   if (totalPages > 1) {
     controls.push(
-      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:p:${encoded}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
-      new ButtonBuilder().setCustomId(`menu:dmslotpage:${kind}:n:${encoded}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
+      new ButtonBuilder().setCustomId(`${prefix}:dmslotpage:${kind}:p:${encoded}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage <= 0),
+      new ButtonBuilder().setCustomId(`${prefix}:dmslotpage:${kind}:n:${encoded}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1),
     );
   }
 
@@ -1056,23 +1113,24 @@ function buildDmSlotRows(kind, ownedGames, dmSetting, pages) {
 // `activeKind` picks which of the 2 kinds' picker is currently shown (see buildDmSlotRows).
 // `pages` pins each kind's own page (e.g. { progression: 1, useful: 0 }) so switching tabs or
 // paging one kind doesn't bounce the other back to page 0 when the menu re-renders.
-function buildDmMenuRows(link, userId, ownedGames, activeKind = "progression", pages = {}) {
+// `prefix` starts every control's customId ("menu" in a channel, "dm:r:<trackerId>" for a DM run)
+// and `backId` is where Back goes.
+function buildDmMenuRows(link, userId, ownedGames, activeKind = "progression", pages = {}, prefix = "menu", backId = "menu:back") {
   if (!ownedGames.length) {
     return [
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("menu:dm:noop").setLabel("You have no games in this tracker").setStyle(ButtonStyle.Secondary).setDisabled(true)
+        new ButtonBuilder().setCustomId(`${prefix}:dm:noop`).setLabel("You have no games in this tracker").setStyle(ButtonStyle.Secondary).setDisabled(true)
       ),
-      backToMenuRow(),
+      backToMenuRow(backId),
     ];
   }
 
   const settings = link.dmSlotSettings?.[userId] ?? {};
-  const rows = [
-    buildDmTabRow(activeKind, pages),
-    ...buildDmSlotRows(activeKind, ownedGames, settings, pages),
-    backToMenuRow(),
+  return [
+    buildDmTabRow(activeKind, pages, prefix),
+    ...buildDmSlotRows(activeKind, ownedGames, settings, pages, prefix),
+    backToMenuRow(backId),
   ];
-  return rows;
 }
 
 // The collection room button is disabled once a tracker is linked, since the tracker replaces it.
@@ -1326,10 +1384,11 @@ async function editPages(messages, pages) {
 // ─── Status embeds ────────────────────────────────────────────────────────────
 
 // `live` adds the "Updates every 5 minutes" footer line, for posted status (not the preview).
-async function buildStatusPages(trackerId, data, guild, live = false, mode = "all", registeredUserIds = []) {
+// `scope` is the server, or the User for a DM run (see buildMemberByUsernameMap).
+async function buildStatusPages(trackerId, data, scope, live = false, mode = "all", registeredUserIds = []) {
   const { games, title, room_host, last_port } = data;
 
-  const memberByUsername = await buildMemberByUsernameMap(guild);
+  const memberByUsername = await buildMemberByUsernameMap(scope);
 
   // Group games by claimed owner; unclaimed slots go under "Unclaimed"
   const groups = new Map();
@@ -1503,19 +1562,34 @@ async function fetchCollectionRoom(roomId) {
 
 // ─── Slash Commands ───────────────────────────────────────────────────────────
 
+// Both commands work in server channels and in the bot's own DM, and the bot can be added to a
+// server or to someone's own account (so its DM works without sharing a server; see greetOwner).
 const commands = [
   new SlashCommandBuilder()
     .setName("menu")
-    .setDescription("Open the bot menu for this channel"),
+    .setDescription("Open the bot menu (this channel's, or your own runs in DMs)"),
 
   new SlashCommandBuilder()
     .setName("help")
     .setDescription("Show information and documentation for this bot"),
-];
+].map(c => c
+  .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM)
+  .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall));
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async function handleMenuCommand(interaction) {
+  if (!interaction.guildId) return handleDmMenuCommand(interaction);
+
+  // Someone who added the bot to their own account can run /menu in any server, including ones
+  // the bot was never invited to, where it can't see or post anything.
+  if (!interaction.guild) {
+    return interaction.reply({
+      content: "❌ I'm not in this server, so I can't track a run here. Ask a server admin to invite me, or use `/menu` in a DM with me to track your own runs.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   const link             = trackerLinkOf(loadLinks(), linkKey(interaction.guildId, interaction.channelId));
   const collectionRoomId = collectionRoomIdFor(interaction);
 
@@ -1529,7 +1603,7 @@ async function handleMenuCommand(interaction) {
 // Replaces the menu with an error and a Back button, for a status view that couldn't load. Used
 // instead of an ephemeral follow-up so the menu isn't left stuck on "Loading...".
 function statusErrorReply(interaction, content) {
-  return interaction.editReply({ content, embeds: [], components: [backToMenuRow()] });
+  return interaction.editReply({ content, embeds: [], components: [backToStartRow(interaction)] });
 }
 
 // Stops the channel's refresh loop and marks its previous post (by stored message IDs, so this
@@ -1745,15 +1819,32 @@ async function handleSelfRegistration(interaction, link, register) {
   });
 }
 
-// Every DM menu action ends up here: fetch the tracker, optionally apply `change` to the user's
-// dmSlotSettings entry (under the links lock), then re-render the DM menu on `kind`'s tab.
+// Where a notification settings menu reads and saves: a server channel's tracker link here, or
+// one of the user's DM runs (see dmRunTarget). Each target gives the links-file lookup, whose
+// Discord names resolve (see buildMemberByUsernameMap), the customId prefix and Back target for
+// its controls, the menu embed, the message for a link that's gone, and takeOver, which turns off
+// the user's notifications for the same tracker elsewhere so nobody gets every item twice.
+function channelDmTarget(interaction) {
+  const key = linkKey(interaction.guildId, interaction.channelId);
+  return {
+    lookup:   links => trackerLinkOf(links, key),
+    scope:    interaction.guild,
+    prefix:   "menu",
+    backId:   "menu:back",
+    embed:    (link, ownedPositions) => buildMenuEmbed(link, interaction.user.id, hasManageChannels(interaction), ownedPositions),
+    goneText: NOT_LINKED_MESSAGE,
+    takeOver: (links, trackerId) => clearDmRunNotifications(links, interaction.user.id, trackerId),
+  };
+}
+
+// Every notification menu action ends up here: fetch the tracker, optionally apply `change` to the
+// user's dmSlotSettings entry (under the links lock), then re-render the menu on `kind`'s tab.
 // `loading` shows a placeholder first, for opening the menu (the other actions are quick edits
 // of a menu that's already on screen).
-async function renderDmMenu(interaction, { kind = "progression", pages = {}, change = null, loading = false } = {}) {
-  const key    = linkKey(interaction.guildId, interaction.channelId);
+async function renderDmMenu(interaction, target, { kind = "progression", pages = {}, change = null, loading = false } = {}) {
   const userId = interaction.user.id;
-  let link     = trackerLinkOf(loadLinks(), key);
-  if (!link) return notLinkedUpdate(interaction);
+  let link     = target.lookup(loadLinks());
+  if (!link) return interaction.update({ content: target.goneText, embeds: [], components: [backToStartRow(interaction)] });
 
   await interaction.deferUpdate();
   if (loading) await interaction.editReply({ content: "Loading DM settings...", embeds: [], components: [] });
@@ -1765,82 +1856,86 @@ async function renderDmMenu(interaction, { kind = "progression", pages = {}, cha
     return statusErrorReply(interaction, `❌ Failed to fetch tracker data: ${err.message}`);
   }
 
+  let turnedOffIn = [];
   if (change) {
     link = await withLinks(async links => {
-      const l = trackerLinkOf(links, key);
+      const l = target.lookup(links);
       if (!l) return null;
       await rebaselineDmBaselinesIfFirstOptIn(l, data);
       l.dmSlotSettings ??= {};
       l.dmSlotSettings[userId] ??= {};
       change(l.dmSlotSettings[userId]);
+      if (hasAnyDmSetting(l.dmSlotSettings[userId])) turnedOffIn = target.takeOver(links, l.trackerId);
       return l;
     });
-    if (!link) return statusErrorReply(interaction, NOT_LINKED_MESSAGE);
+    if (!link) return statusErrorReply(interaction, target.goneText);
   }
 
-  const { ownedGames, ownedPositions } = await getOwnedGames(interaction.guild, data, userId);
+  const { ownedGames, ownedPositions } = await getOwnedGames(target.scope, data, userId);
 
   await interaction.editReply({
     content: null,
-    embeds: [buildMenuEmbed(link, userId, hasManageChannels(interaction), ownedPositions)],
-    components: buildDmMenuRows(link, userId, ownedGames, kind, pages),
+    embeds: [target.embed(link, ownedPositions)],
+    components: buildDmMenuRows(link, userId, ownedGames, kind, pages, target.prefix, target.backId),
   });
+  if (turnedOffIn.length) {
+    await interaction.followUp({
+      content: `🔕 Your notifications for this tracker in ${turnedOffIn.join(", ")} are now off, so you don't get everything twice.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 }
 
-// customId: menu:dmtab:<kind>:<pages...>. A plain view change, no settings write.
-async function handleDmTabSwitch(interaction) {
-  const [, , kind, ...pageParts] = interaction.customId.split(":");
-  return renderDmMenu(interaction, { kind, pages: decodeDmPages(pageParts) });
-}
+// A notification menu control. Its customId is <prefix>:<action>:<kind>:..., split after the
+// prefix into `action` and `parts`:
+// - dmtab:<kind>:<pages...>, a plain tab switch, no settings write.
+// - dmslot:<kind>:<pages...>, the per-game select. Only reachable while the kind isn't "all" (the
+//   select is disabled otherwise). The select doesn't track checked state (see buildDmSlotRows),
+//   so each picked game flips on or off, and games not picked stay as they were, on any page.
+// - dmslotall:<kind>:<on|off>:<pages...>, Enable All / Disable All for one kind.
+// - dmhint:<kind>:<on|off>:<pages...>, a plain boolean (see HINT_FLAG_KEY) covering every game
+//   the user owns, unlike the per-game pickers, since hints affect other players and shouldn't be
+//   silently scoped to a subset of games.
+// - dmslotpage:<kind>:<p|n>:<pages...>, pages the select.
+function handleDmControl(interaction, target, action, [kind, ...rest]) {
+  if (action === "dmtab") return renderDmMenu(interaction, target, { kind, pages: decodeDmPages(rest) });
 
-// customId: menu:dmslot:<kind>:<pages...>. Only reachable while the kind isn't "all" (the select
-// is disabled otherwise). The select doesn't track checked state (see buildDmSlotRows), so each
-// picked game flips on or off, and games not picked stay as they were, on any page.
-async function handleDmSlotSelect(interaction) {
-  const [, , kind, ...pageParts] = interaction.customId.split(":");
-  const toggled = interaction.values.map(Number);
-  return renderDmMenu(interaction, {
-    kind,
-    pages: decodeDmPages(pageParts),
-    change: settings => {
-      const selected = new Set(Array.isArray(settings[kind]) ? settings[kind] : []);
-      for (const pos of toggled) {
-        if (selected.has(pos)) selected.delete(pos);
-        else selected.add(pos);
-      }
-      settings[kind] = [...selected];
-    },
-  });
-}
+  if (action === "dmslot") {
+    const toggled = interaction.values.map(Number);
+    return renderDmMenu(interaction, target, {
+      kind,
+      pages: decodeDmPages(rest),
+      change: settings => {
+        const selected = new Set(Array.isArray(settings[kind]) ? settings[kind] : []);
+        for (const pos of toggled) {
+          if (selected.has(pos)) selected.delete(pos);
+          else selected.add(pos);
+        }
+        settings[kind] = [...selected];
+      },
+    });
+  }
 
-// customId: menu:dmslotall:<kind>:<on|off>:<pages...>. Enable All / Disable All for one kind.
-async function handleDmSlotAllToggle(interaction) {
-  const [, , kind, action, ...pageParts] = interaction.customId.split(":");
-  return renderDmMenu(interaction, {
-    kind,
-    pages: decodeDmPages(pageParts),
-    change: settings => { settings[kind] = action === "on" ? "all" : []; },
-  });
-}
-
-// customId: menu:dmhint:<kind>:<on|off>:<pages...>. A plain boolean (see HINT_FLAG_KEY) covering
-// every game the user owns, unlike the per-game pickers, since hints affect other players and
-// shouldn't be silently scoped to a subset of games.
-async function handleDmHintToggle(interaction) {
-  const [, , kind, action, ...pageParts] = interaction.customId.split(":");
-  return renderDmMenu(interaction, {
-    kind,
-    pages: decodeDmPages(pageParts),
-    change: settings => { settings[HINT_FLAG_KEY[kind]] = action === "on"; },
-  });
-}
-
-// customId: menu:dmslotpage:<kind>:<p|n>:<pages...>
-async function handleDmSlotPageButton(interaction) {
-  const [, , kind, dir, ...pageParts] = interaction.customId.split(":");
+  const [arg, ...pageParts] = rest;
   const pages = decodeDmPages(pageParts);
-  pages[kind] += dir === "n" ? 1 : -1;
-  return renderDmMenu(interaction, { kind, pages });
+  if (action === "dmslotall") {
+    return renderDmMenu(interaction, target, { kind, pages, change: settings => { settings[kind] = arg === "on" ? "all" : []; } });
+  }
+  if (action === "dmhint") {
+    return renderDmMenu(interaction, target, { kind, pages, change: settings => { settings[HINT_FLAG_KEY[kind]] = arg === "on"; } });
+  }
+  if (action === "dmslotpage") {
+    pages[kind] += arg === "n" ? 1 : -1;
+    return renderDmMenu(interaction, target, { kind, pages });
+  }
+}
+
+const DM_CONTROL_ACTIONS = new Set(["dmtab", "dmslot", "dmslotall", "dmhint", "dmslotpage"]);
+
+// A channel menu's notification control: menu:<action>:...
+function handleChannelDmControl(interaction) {
+  const [, action, ...parts] = interaction.customId.split(":");
+  return handleDmControl(interaction, channelDmTarget(interaction), action, parts);
 }
 
 // Both Link Tracker and Link Collection Room ask for one URL or ID, in a field named "url".
@@ -2120,7 +2215,7 @@ async function handleMenuButton(interaction) {
   if (id === "menu:status")     return handleMenuStatus(interaction, link, collectionRoomId);
   if (id === "menu:register")   return handleSelfRegistration(interaction, link, true);
   if (id === "menu:unregister") return handleSelfRegistration(interaction, link, false);
-  if (id === "menu:dm")         return renderDmMenu(interaction, { loading: true });
+  if (id === "menu:dm")         return renderDmMenu(interaction, channelDmTarget(interaction), { loading: true });
 
   // Everything below is admin-only.
   if (id.startsWith("menu:admin") && !isManager) {
@@ -2158,7 +2253,29 @@ async function handleMenuButton(interaction) {
   }
 }
 
+// Like /menu, /help covers the server menu in a server and the run list in DMs. Each version ends
+// with a pointer to the other, since the two share notification settings.
 async function handleHelp(interaction) {
+  const menuHelp = interaction.guildId
+    ? {
+        name: "`/menu`",
+        value:
+          "Opens the bot menu for this channel.\n" +
+          "- **Status**: preview the room status, then **Post to channel**. Posted status updates itself every 5 minutes.\n" +
+          "- **Register / Unregister**: join or leave the channel's view (only in **Registered Only** mode).\n" +
+          "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games.\n" +
+          "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode** and **Register Someone**.\n" +
+          "Want to follow runs privately? Use `/menu` in a DM with me.",
+      }
+    : {
+        name: "`/menu`",
+        value:
+          "Opens your own list of runs, no server needed.\n" +
+          "- **New Run**: paste a CheeseTrackers tracker link (pasting one in a message to me works too).\n" +
+          "- Pick a run to see its **Status** (just your games, or everyone's) or set up its **DM Notifications**: a DM when you receive a **Progression** or **Useful** item, and **Hints** involving your games.\n" +
+          "Notifications for a run are on in one place at a time: turning them on here turns them off for that run in any server channel, and the other way around.",
+      };
+
   const embed = new EmbedBuilder()
     .setColor(EMBED_COLOR)
     .setTitle("Archeesepelago Discord Bot")
@@ -2167,20 +2284,406 @@ async function handleHelp(interaction) {
       "Posts Archipelago multiworld room status from CheeseTrackers into Discord."
     )
     .addFields(
-      {
-        name: "`/menu`",
-        value:
-          "Opens the bot menu for this channel.\n" +
-          "- **Status**: preview the room status, then **Post to channel**. Posted status updates itself every 5 minutes.\n" +
-          "- **Register / Unregister**: join or leave the channel's view (only in **Registered Only** mode).\n" +
-          "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games.\n" +
-          "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode** and **Register Someone**.",
-      },
+      menuHelp,
       { name: "`/help`", value: "Show this message." },
       { name: "GitHub",  value: "[github.com/ChakraaThePanda/Archeesepelago-Discord-Bot](https://github.com/ChakraaThePanda/Archeesepelago-Discord-Bot)" },
     );
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+// ─── DM runs (menus) ──────────────────────────────────────────────────────────
+// /menu in a DM with the bot opens the user's own run list instead of a channel menu. customIds:
+// dm:home (the run picker), dm:pick (its select), dm:new (the Add a Run popup) and dm:modal:new
+// (its submit), dm:add:<trackerId> (the button under a pasted tracker link), and
+// dm:r:<trackerId>:<action>:... for one run: run (its menu), st:<view>:<page>[:open] (status, view
+// "mine" or "all"), notif (notification settings, then handleDmControl's controls), remove and
+// removeyes.
+
+const DM_RUN_GONE = "❌ That run isn't in your list anymore.";
+
+function dmRunTitle(run) {
+  return run.title || "Untitled tracker";
+}
+
+// Most recently active first, so the run someone is playing stays at the top of the picker.
+function dmRunsSorted(userId) {
+  const lastSeen = run => run.lastActivityAt ?? run.addedAt ?? 0;
+  return dmRunsOf(loadLinks(), userId).sort((a, b) => lastSeen(b) - lastSeen(a));
+}
+
+function buildDmHomeView(userId, content = null) {
+  const runs  = dmRunsSorted(userId);
+  const embed = new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setTitle("Your Runs")
+    .setDescription(runs.length
+      ? "Pick a run to see its status or change its notifications."
+      : "You haven't added any runs yet.\nPress **New Run** and paste a CheeseTrackers tracker link.")
+    .setFooter({ text: `${runs.length}/${MAX_DM_RUNS} runs` });
+
+  const rows = [];
+  if (runs.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId("dm:pick")
+        .setPlaceholder("Select a run...")
+        .addOptions(runs.map(run =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(dmRunTitle(run).slice(0, 100))
+            .setDescription(hasAnyDmSetting(run.dmSlotSettings?.[userId]) ? "🔔 Notifications on" : "🔕 Notifications off")
+            .setValue(run.trackerId)
+        ))
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("dm:new").setLabel("➕ New Run").setStyle(ButtonStyle.Success).setDisabled(runs.length >= MAX_DM_RUNS)
+  ));
+  return { content, embeds: [embed], components: rows };
+}
+
+// `ownedPositions` is only known once the tracker was fetched (the notification menu). Then a run
+// where none of the user's slots match their Discord name says so, since nothing would notify.
+function buildDmRunEmbed(run, user, ownedPositions = null) {
+  const lines = [`**[Tracker Room](${trackerUrl(run.trackerId)})**`, ...dmSettingLines(run.dmSlotSettings?.[user.id], ownedPositions)];
+  if (ownedPositions && !ownedPositions.length) {
+    const names = [user.username, user.globalName].filter(Boolean).map(n => `**${n}**`).join(" or ");
+    lines.push("", `No game in this run is claimed under your Discord name (${names}). Claim your slots on CheeseTrackers with that name to get notifications.`);
+  }
+  return new EmbedBuilder().setColor(EMBED_COLOR).setTitle(dmRunTitle(run).slice(0, 256)).setDescription(lines.join("\n"));
+}
+
+function buildDmRunView(run, user, content = null) {
+  const id = `dm:r:${run.trackerId}`;
+  return {
+    content,
+    embeds: [buildDmRunEmbed(run, user)],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`${id}:st:mine:0:open`).setLabel("Status").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`${id}:notif`).setLabel("DM Notifications").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`${id}:remove`).setLabel("Remove Run").setStyle(ButtonStyle.Danger),
+      ),
+      backToMenuRow("dm:home"),
+    ],
+  };
+}
+
+function dmRunGoneUpdate(interaction) {
+  return interaction.update({ content: DM_RUN_GONE, embeds: [], components: [backToMenuRow("dm:home")] });
+}
+
+// The DM run counterpart of channelDmTarget.
+function dmRunTarget(interaction, trackerId) {
+  const user = interaction.user;
+  return {
+    lookup:   links => dmRunOf(links, user.id, trackerId),
+    scope:    user,
+    prefix:   `dm:r:${trackerId}`,
+    backId:   `dm:r:${trackerId}:run`,
+    embed:    (run, ownedPositions) => buildDmRunEmbed(run, user, ownedPositions),
+    goneText: DM_RUN_GONE,
+    takeOver: (links, id) => clearChannelNotifications(links, user.id, id),
+  };
+}
+
+// Turning notifications on for a DM run turns them off for the same tracker in every server
+// channel, and the other way around (clearDmRunNotifications), so each item only arrives once.
+// Both return where they turned something off, for the note shown to the user.
+function clearChannelNotifications(links, userId, trackerId) {
+  const turnedOffIn = [];
+  for (const key of Object.keys(links)) {
+    const link = trackerLinkOf(links, key);
+    if (link?.trackerId !== trackerId || !hasAnyDmSetting(link.dmSlotSettings?.[userId])) continue;
+    delete link.dmSlotSettings[userId];
+    turnedOffIn.push(`<#${key.split(":")[1]}>`);
+  }
+  return turnedOffIn;
+}
+
+function clearDmRunNotifications(links, userId, trackerId) {
+  const run = dmRunOf(links, userId, trackerId);
+  if (!hasAnyDmSetting(run?.dmSlotSettings?.[userId])) return [];
+  delete run.dmSlotSettings[userId];
+  return ["your DMs with me"];
+}
+
+function removeDmRun(links, userId, trackerId) {
+  const entry = links[dmUserKey(userId)];
+  if (!entry?.dmRuns || !Object.hasOwn(entry.dmRuns, trackerId)) return;
+  delete entry.dmRuns[trackerId];
+  if (!Object.keys(entry.dmRuns).length) delete links[dmUserKey(userId)];
+}
+
+async function handleDmMenuCommand(interaction) {
+  await interaction.reply({ ...buildDmHomeView(interaction.user.id), flags: MessageFlags.Ephemeral });
+}
+
+// Someone who only added the bot to their account (no shared server) has no obvious way to open
+// its DM. For a private bot that someone can only be its owner, so the bot says hi to its owner
+// by itself, which puts its DM in their DM list: right away if it already can (they share a server
+// or added it before), otherwise within seconds of them adding it. It's said once: only while that
+// DM is empty, which it never is again after the hello.
+const OWNER_HELLO_RETRY_MS = 10 * 1000;
+let ownerId = null;
+
+// True once the owner was greeted or didn't need it, false to try again later.
+async function greetOwner() {
+  try {
+    if (!ownerId) {
+      const { owner } = await client.application.fetch();
+      ownerId = owner?.ownerId ?? owner?.id; // a team's owner, or the owning user
+    }
+    const dm = await (await client.users.fetch(ownerId)).createDM();
+    if (!(await dm.messages.fetch({ limit: 1 })).size) {
+      await dm.send("👋 Hi! Type `/menu` here to add the runs you want to follow. Your item and hint notifications will arrive here too.");
+      console.log("[dm-hello] Said hi to the bot's owner in DMs");
+    }
+    noteSuccess("dm-hello", "owner");
+    return true;
+  } catch (err) {
+    // Can't DM them yet: no shared server and not added to their account (50278), or DMs blocked (50007).
+    if (err.code !== 50278 && err.code !== 50007) noteFailure("dm-hello", "owner", err);
+    return false;
+  }
+}
+
+async function keepGreetingOwner() {
+  if (await greetOwner()) return;
+  const timer = setInterval(async () => {
+    if (await greetOwner()) clearInterval(timer);
+  }, OWNER_HELLO_RETRY_MS);
+}
+
+// From the Add a Run popup (`input` is what was typed) or the button under a pasted tracker link.
+async function handleDmAddRun(interaction, input) {
+  let trackerId;
+  try {
+    trackerId = parseTrackerId(input);
+  } catch (err) {
+    return interaction.reply({ content: `❌ ${err.message}`, flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferUpdate();
+  await interaction.editReply({ content: "Loading tracker...", embeds: [], components: [] });
+
+  let data;
+  try {
+    data = await fetchTracker(trackerId);
+  } catch (err) {
+    return statusErrorReply(interaction, `❌ Could not reach that tracker: ${err.message}`);
+  }
+
+  const userId = interaction.user.id;
+  const result = await withLinks(links => {
+    const existing = dmRunOf(links, userId, trackerId);
+    if (existing) {
+      if (data.title) existing.title = data.title;
+      return "exists";
+    }
+    if (dmRunsOf(links, userId).length >= MAX_DM_RUNS) return "full";
+    const entry = (links[dmUserKey(userId)] ??= {});
+    entry.dmRuns ??= {};
+    entry.dmRuns[trackerId] = { trackerId, title: data.title || "", addedAt: Date.now() };
+    return "added";
+  });
+
+  if (result === "full") {
+    return statusErrorReply(interaction, `❌ You already have ${MAX_DM_RUNS} runs. Remove one before adding another.`);
+  }
+  const run = dmRunOf(loadLinks(), userId, trackerId);
+  await interaction.editReply(buildDmRunView(run, interaction.user, result === "exists" ? "This run is already in your list." : "✅ Run added."));
+}
+
+// Status of a DM run, as one page at a time. "mine" shows only the user's own games (the status
+// embed's registered view, with just them registered) and falls back to everyone when none of the
+// run's slots match their Discord name. `open` marks coming from the run menu, the moment that
+// counts as using the run (it keeps it from being dropped as stale and moves it up the picker).
+async function handleDmRunStatus(interaction, trackerId, view, page, open) {
+  const user = interaction.user;
+  if (!dmRunOf(loadLinks(), user.id, trackerId)) return dmRunGoneUpdate(interaction);
+
+  await interaction.deferUpdate();
+  if (open) await interaction.editReply({ content: "Loading tracker...", embeds: [], components: [] });
+
+  let data;
+  try {
+    data = await fetchTracker(trackerId);
+  } catch (err) {
+    return statusErrorReply(interaction, `❌ Failed to fetch tracker data: ${err.message}`);
+  }
+
+  if (open) {
+    await withLinks(links => {
+      const run = dmRunOf(links, user.id, trackerId);
+      if (!run) return;
+      run.lastActivityAt = Date.now();
+      if (data.title) run.title = data.title;
+    });
+  }
+
+  const { ownedGames } = await getOwnedGames(user, data, user.id);
+  const showMine = view === "mine" && ownedGames.length > 0;
+  const pages    = await buildStatusPages(trackerId, data, user, false, showMine ? "registered" : "all", [user.id]);
+  const current  = Math.max(0, Math.min(page, pages.length - 1));
+  const shown    = showMine ? "mine" : "all";
+  const id       = `dm:r:${trackerId}:st`;
+
+  const buttons = [];
+  if (pages.length > 1) {
+    buttons.push(
+      new ButtonBuilder().setCustomId(`${id}:${shown}:${current - 1}`).setLabel("◀ Prev").setStyle(ButtonStyle.Secondary).setDisabled(current <= 0),
+      new ButtonBuilder().setCustomId(`${id}:${shown}:${current + 1}`).setLabel("Next ▶").setStyle(ButtonStyle.Secondary).setDisabled(current >= pages.length - 1),
+    );
+  }
+  buttons.push(
+    new ButtonBuilder()
+      .setCustomId(`${id}:${showMine ? "all" : "mine"}:0`)
+      .setLabel(showMine ? "Show Everyone" : "Show Only Mine")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!ownedGames.length),
+  );
+
+  await interaction.editReply({
+    content: null,
+    embeds: [pages[current]],
+    components: [new ActionRowBuilder().addComponents(...buttons), backToMenuRow(`dm:r:${trackerId}:run`)],
+  });
+}
+
+async function handleDmRunInteraction(interaction) {
+  const id   = interaction.customId;
+  const user = interaction.user;
+
+  if (id === "dm:home")      return interaction.update(buildDmHomeView(user.id));
+  if (id === "dm:new")       return showUrlModal(interaction, "dm:modal:new", "Add a Run", "CheeseTrackers URL or tracker ID");
+  if (id === "dm:modal:new") return handleDmAddRun(interaction, interaction.fields.getTextInputValue("url"));
+  if (id.startsWith("dm:add:")) return handleDmAddRun(interaction, id.slice("dm:add:".length));
+
+  // Tracker IDs can't contain ":" (enforced by parseTrackerId), so splitting is safe.
+  const [, , trackerId, action, ...parts] = id === "dm:pick" ? ["dm", "r", interaction.values[0], "run"] : id.split(":");
+  const run = dmRunOf(loadLinks(), user.id, trackerId);
+
+  if (action === "run") {
+    if (!run) return dmRunGoneUpdate(interaction);
+    return interaction.update(buildDmRunView(run, user));
+  }
+  if (action === "st")    return handleDmRunStatus(interaction, trackerId, parts[0], parseInt(parts[1], 10) || 0, parts[2] === "open");
+  if (action === "notif") return renderDmMenu(interaction, dmRunTarget(interaction, trackerId), { loading: true });
+  if (DM_CONTROL_ACTIONS.has(action)) return handleDmControl(interaction, dmRunTarget(interaction, trackerId), action, parts);
+
+  if (action === "remove") {
+    if (!run) return dmRunGoneUpdate(interaction);
+    return interaction.update({
+      content: `Remove **${dmRunTitle(run)}** from your runs? Its DM notifications stop too.`,
+      embeds: [],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`dm:r:${trackerId}:removeyes`).setLabel("Yes, remove").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`dm:r:${trackerId}:run`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+      )],
+    });
+  }
+  if (action === "removeyes") {
+    await withLinks(links => removeDmRun(links, user.id, trackerId));
+    return interaction.update(buildDmHomeView(user.id, "✅ Run removed."));
+  }
+}
+
+// Item and hint notifications for DM runs. A DM run has no live post whose refresh would check
+// for them (the way a channel's does), so this one timer checks every DM run with notifications
+// on, every REFRESH_INTERVAL_MS, fetching each tracker once however many people follow it. It
+// also drops runs with no activity in 30+ days, like stale channel links.
+let dmRunCheckRunning = false;
+const dmRunHashes     = new Map(); // trackerId -> last hashTrackerData seen, to notice activity
+
+async function checkDmRuns() {
+  if (dmRunCheckRunning) return; // the previous round is still going (a slow API)
+  dmRunCheckRunning = true;
+  try {
+    const now     = Date.now();
+    const watched = new Map(); // trackerId -> userIds with notifications on
+    const stale   = [];
+    for (const [key, entry] of Object.entries(loadLinks())) {
+      if (!key.startsWith("dm:")) continue;
+      const userId = key.slice("dm:".length);
+      for (const run of Object.values(entry.dmRuns ?? {})) {
+        if (now - Math.max(run.addedAt ?? 0, run.lastActivityAt ?? 0) > STALE_LINK_MS) {
+          stale.push([userId, run.trackerId]);
+        } else if (hasAnyDmSetting(run.dmSlotSettings?.[userId])) {
+          if (!watched.has(run.trackerId)) watched.set(run.trackerId, []);
+          watched.get(run.trackerId).push(userId);
+        }
+      }
+    }
+    if (stale.length) {
+      await withLinks(links => { for (const [userId, trackerId] of stale) removeDmRun(links, userId, trackerId); });
+    }
+    for (const trackerId of dmRunHashes.keys()) {
+      if (!watched.has(trackerId)) dmRunHashes.delete(trackerId);
+    }
+
+    for (const [trackerId, userIds] of watched) {
+      let data;
+      try {
+        data = await fetchTracker(trackerId);
+        noteSuccess("dm-runs", trackerId);
+      } catch (err) {
+        if (isTransientError(err)) noteFailure("dm-runs", trackerId, err);
+        else console.error("[dm-runs]", err);
+        continue;
+      }
+
+      const hash     = hashTrackerData(data);
+      const previous = dmRunHashes.get(trackerId);
+      dmRunHashes.set(trackerId, hash);
+      if (previous !== undefined && previous !== hash) {
+        await withLinks(links => {
+          for (const userId of userIds) {
+            const run = dmRunOf(links, userId, trackerId);
+            if (run) run.lastActivityAt = now;
+          }
+        });
+      }
+
+      for (const userId of userIds) {
+        let user;
+        try {
+          user = await client.users.fetch(userId);
+        } catch (err) {
+          console.warn(`[dm-runs] Couldn't look up user ${userId}:`, err.message);
+          continue;
+        }
+        await checkNewDms(data, user, `${dmUserKey(userId)}:${trackerId}`, links => dmRunOf(links, userId, trackerId));
+      }
+    }
+  } catch (err) {
+    console.error("[dm-runs]", err);
+  } finally {
+    dmRunCheckRunning = false;
+  }
+}
+
+// Someone typing to the bot in DMs gets pointed at /menu, at most once an hour so a chatty DM
+// doesn't get a reply to every line. A pasted tracker link always gets an Add button instead.
+const DM_HELLO_COOLDOWN_MS = 60 * 60 * 1000;
+const lastDmHelloAt        = new Map(); // userId -> when they were last pointed at /menu
+const TRACKER_LINK_RE      = new RegExp(`${CT_HOST.replace(/\./g, "\\.")}/tracker/([A-Za-z0-9_-]{1,80})`);
+
+async function handleDirectMessage(message) {
+  const match = message.content.match(TRACKER_LINK_RE);
+  if (match) {
+    return message.reply({
+      content: "Want me to follow this run here in DMs?",
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`dm:add:${match[1]}`).setLabel("➕ Add This Run").setStyle(ButtonStyle.Success)
+      )],
+    });
+  }
+
+  const now = Date.now();
+  if (now - (lastDmHelloAt.get(message.author.id) ?? 0) < DM_HELLO_COOLDOWN_MS) return;
+  lastDmHelloAt.set(message.author.id, now);
+  return message.reply("Hi! Type `/menu` here to add and follow your own runs, or paste a CheeseTrackers tracker link and I'll offer to add it. `/help` explains the rest.");
 }
 
 // ─── Client ───────────────────────────────────────────────────────────────────
@@ -2193,11 +2696,16 @@ process.on("unhandledRejection", err => {
   console.error("[unhandled rejection]", err);
 });
 
+// DirectMessages (plus the Channel partial, since DM channels aren't cached until used) only
+// delivers messages people send the bot in DMs, for the "use /menu" reply. Reading what a DM
+// says doesn't need the Message Content intent.
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
   ],
+  partials: [Partials.Channel],
 });
 
 function setPresence() {
@@ -2223,6 +2731,13 @@ client.once("clientReady", async () => {
 
   await resumeTrackerPosts();
   await resumeCollectionPosts();
+  setInterval(checkDmRuns, REFRESH_INTERVAL_MS);
+  keepGreetingOwner();
+});
+
+client.on("messageCreate", message => {
+  if (message.guildId || message.author.bot) return;
+  handleDirectMessage(message).catch(err => console.warn("[dm-message] Couldn't reply:", err.message));
 });
 
 // Fetches a posted status's messages for resuming. Returns null if the channel itself is gone
@@ -2361,15 +2876,16 @@ client.on("interactionCreate", async interaction => {
       if (interaction.commandName === "menu") return await handleMenuCommand(interaction);
       if (interaction.commandName === "help") return await handleHelp(interaction);
     }
+    // Everything a DM menu sends starts with "dm:", and nothing a channel menu sends does.
+    if (interaction.customId?.startsWith("dm:")) return await handleDmRunInteraction(interaction);
     if (interaction.isButton()) {
-      if (interaction.customId.startsWith("pg:"))              return await handlePageButton(interaction);
-      if (interaction.customId.startsWith("post:"))            return await handlePostButton(interaction);
-      if (interaction.customId.startsWith("postcr:"))          return await handleCollectionPostButton(interaction);
-      if (interaction.customId.startsWith("menu:dmslotpage:")) return await handleDmSlotPageButton(interaction);
-      if (interaction.customId.startsWith("menu:dmslotall:"))  return await handleDmSlotAllToggle(interaction);
-      if (interaction.customId.startsWith("menu:dmhint:"))     return await handleDmHintToggle(interaction);
-      if (interaction.customId.startsWith("menu:dmtab:"))      return await handleDmTabSwitch(interaction);
-      if (interaction.customId.startsWith("menu:"))            return await handleMenuButton(interaction);
+      if (interaction.customId.startsWith("pg:"))     return await handlePageButton(interaction);
+      if (interaction.customId.startsWith("post:"))   return await handlePostButton(interaction);
+      if (interaction.customId.startsWith("postcr:")) return await handleCollectionPostButton(interaction);
+      if (interaction.customId.startsWith("menu:")) {
+        if (DM_CONTROL_ACTIONS.has(interaction.customId.split(":")[1])) return await handleChannelDmControl(interaction);
+        return await handleMenuButton(interaction);
+      }
     }
     if (interaction.isModalSubmit()) {
       if (interaction.customId === "modal:link")       return await handleLinkModalSubmit(interaction);
@@ -2379,7 +2895,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId === "menu:admin:registeruser:select") return await handleRegisterUserSelect(interaction);
     }
     if (interaction.isStringSelectMenu()) {
-      if (interaction.customId.startsWith("menu:dmslot:")) return await handleDmSlotSelect(interaction);
+      if (interaction.customId.startsWith("menu:dmslot:")) return await handleChannelDmControl(interaction);
     }
   } catch (err) {
     if (err.code === 10062) return; // Interaction expired (e.g. the bot restarted mid-flight), nothing to do
@@ -2390,7 +2906,7 @@ client.on("interactionCreate", async interaction => {
     try {
       if (interaction.deferred || interaction.replied) {
         // Anything past a slash command is editing the menu, so offer a way back to it.
-        await interaction.editReply({ content: msg, embeds: [], components: interaction.isChatInputCommand() ? [] : [backToMenuRow()] });
+        await interaction.editReply({ content: msg, embeds: [], components: interaction.isChatInputCommand() ? [] : [backToStartRow(interaction)] });
       } else {
         await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
       }
