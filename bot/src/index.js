@@ -25,6 +25,7 @@ const {
   Partials,
   InteractionContextType,
   ApplicationIntegrationType,
+  embedLength,
 } = require("discord.js");
 const fs = require("fs");
 
@@ -585,8 +586,10 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
   // links.json operations never wait on Discord API calls.
   if (!pendingItems.length && !pendingHints.length) return;
 
-  // With notifyInChannel on, notifications go to the linked channel (key is "<guildId>:<channelId>"
-  // there) with a ping instead. If the channel can't be reached or posted in, they fall back to DMs.
+  // With notifyInChannel on, notifications for people who can see the linked channel (key is
+  // "<guildId>:<channelId>" there) are posted in it with a ping instead, grouped per person so a
+  // release or collect is a few messages rather than one per item. Everyone else, or everyone if
+  // the channel can't be reached or posted in, still gets DMs.
   let channel = null;
   if (inChannel) {
     try {
@@ -595,15 +598,19 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
       console.warn(`[item-dm] Couldn't reach channel for ${key}, sending DMs instead:`, err.message);
     }
   }
-  const deliver = async (member, embed) => {
-    if (channel) {
-      try {
-        return await channel.send({ content: `<@${member.id}>`, embeds: [embed], allowedMentions: { users: [member.id] } });
-      } catch (err) {
-        console.warn(`[item-dm] Couldn't post in channel for ${key}, sending a DM instead:`, err.message);
-      }
+  const postsInChannel = member => Boolean(channel?.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel));
+  const channelPosts   = new Map(); // memberId -> { member, embeds }
+  const sendDm = async (member, embed, tag) => {
+    try {
+      await member.send({ embeds: [embed] });
+    } catch (err) {
+      console.warn(`[${tag}] Failed to DM ${member.id}:`, err.message);
     }
-    return member.send({ embeds: [embed] });
+  };
+  const deliver = (member, embed, tag) => {
+    if (!postsInChannel(member)) return sendDm(member, embed, tag);
+    if (!channelPosts.has(member.id)) channelPosts.set(member.id, { member, embeds: [] });
+    channelPosts.get(member.id).embeds.push({ embed, tag });
   };
 
   for (const p of pendingItems) {
@@ -635,11 +642,7 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
       .setDescription(`${itemName}\n${p.game.name} (${p.game.game})`)
       .addFields({ name: "Found by", value: senderLabel });
 
-    try {
-      await deliver(p.member, embed);
-    } catch (err) {
-      console.warn(`[item-dm] Failed to notify ${p.member.id}:`, err.message);
-    }
+    await deliver(p.member, embed, "item-dm");
   }
 
   for (const p of pendingHints) {
@@ -666,6 +669,12 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
     const otherLabel = p.otherGame ? `${p.otherGame.name} (${p.otherGame.game})` : `Player ${p.otherPlayer}`;
     const yourLabel   = `${p.game.name} (${p.game.game})`;
 
+    // "Your"/"Their" reads fine in a DM, but in a shared channel it's unclear whose is whose, so
+    // a channel post names the slots instead.
+    const isPost    = postsInChannel(p.member);
+    const yourName  = isPost ? `${p.game.name}'s` : "Your";
+    const theirName = isPost ? `${p.otherGame?.name ?? `Player ${p.otherPlayer}`}'s` : "Their";
+
     const embed = new EmbedBuilder()
       .setColor(HINT_DM_COLOR)
       .setAuthor({ name: "New Hint" })
@@ -674,20 +683,48 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
 
     if (p.scenario === "item") {
       embed.addFields(
-        { name: "Your Item", value: `${itemLabel}\n${yourLabel}` },
-        { name: "Their Location", value: `${locationName}\n${otherLabel}` },
+        { name: `${yourName} Item`, value: `${itemLabel}\n${yourLabel}` },
+        { name: `${theirName} Location`, value: `${locationName}\n${otherLabel}` },
       );
     } else {
       embed.addFields(
-        { name: "Your Location", value: `${locationName}\n${yourLabel}` },
-        { name: "Their Item", value: `${itemLabel}\n${otherLabel}` },
+        { name: `${yourName} Location`, value: `${locationName}\n${yourLabel}` },
+        { name: `${theirName} Item`, value: `${itemLabel}\n${otherLabel}` },
       );
     }
 
-    try {
-      await deliver(p.member, embed);
-    } catch (err) {
-      console.warn(`[hint-dm] Failed to notify ${p.member.id}:`, err.message);
+    await deliver(p.member, embed, "hint-dm");
+  }
+
+  // One ping per person, with up to 10 embeds per message (and under Discord's 6000-character
+  // total). If posting fails once (e.g. the bot lost Send Messages), the rest of this check goes
+  // out as DMs, logged once rather than per notification.
+  let channelFailed = false;
+  for (const { member, embeds } of channelPosts.values()) {
+    const chunks = [];
+    let chunk = [], size = 0;
+    for (const e of embeds) {
+      const len = embedLength(e.embed.toJSON());
+      if (chunk.length && (chunk.length === 10 || size + len > 6000)) {
+        chunks.push(chunk);
+        chunk = []; size = 0;
+      }
+      chunk.push(e);
+      size += len;
+    }
+    if (chunk.length) chunks.push(chunk);
+
+    for (const c of chunks) {
+      if (!channelFailed) {
+        try {
+          await channel.send({ content: `<@${member.id}>`, embeds: c.map(e => e.embed), allowedMentions: { users: [member.id] } });
+          continue;
+        } catch (err) {
+          channelFailed = true;
+          console.warn(`[item-dm] Couldn't post in channel for ${key}, sending DMs instead:`, err.message);
+        }
+      }
+      for (const e of c) await sendDm(member, e.embed, e.tag);
     }
   }
 }
@@ -1181,8 +1218,8 @@ function buildAdminMenuRows(link, collectionRoomId = null) {
     ),
     new ActionRowBuilder().addComponents(
       link?.notifyInChannel
-        ? new ButtonBuilder().setCustomId("menu:admin:notifyhere:off").setLabel("Send Item DMs as DMs Again").setStyle(ButtonStyle.Danger)
-        : new ButtonBuilder().setCustomId("menu:admin:notifyhere:on").setLabel("Send All Item DMs in This Channel").setStyle(ButtonStyle.Success).setDisabled(!link),
+        ? new ButtonBuilder().setCustomId("menu:admin:notifyhere:off").setLabel("Send Notifications as DMs").setStyle(ButtonStyle.Danger)
+        : new ButtonBuilder().setCustomId("menu:admin:notifyhere:on").setLabel("Post Notifications in This Channel").setStyle(ButtonStyle.Success).setDisabled(!link),
     ),
   ];
   if (link?.mode === "registered") {
@@ -2214,9 +2251,21 @@ async function handleAdminViewMode(interaction, link, mode) {
   }
 }
 
-// The "Send All Item DMs in This Channel" toggle (see notifyInChannel). Only changes where
+// The "Post Notifications in This Channel" toggle (see notifyInChannel). Only changes where
 // notifications go; everyone keeps their own settings in DM Notifications.
 async function handleAdminNotifyHere(interaction, on) {
+  // Refuse up front rather than confirm and then quietly fall back to DMs on every notification.
+  if (on) {
+    const perms = interaction.appPermissions;
+    const send  = interaction.channel?.isThread() ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages;
+    if (perms && !perms.has([PermissionFlagsBits.ViewChannel, send, PermissionFlagsBits.EmbedLinks])) {
+      return interaction.reply({
+        content: "❌ I need the **View Channel**, **Send Messages** and **Embed Links** permissions in this channel to post notifications here.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+  }
+
   const key       = linkKey(interaction.guildId, interaction.channelId);
   const freshLink = await withLinks(links => {
     const l = trackerLinkOf(links, key);
@@ -2230,7 +2279,7 @@ async function handleAdminNotifyHere(interaction, on) {
   await interaction.update({ content: null, embeds: [buildMenuEmbed(freshLink, interaction.user.id, true)], components: buildAdminMenuRows(freshLink) });
   await interaction.followUp({
     content: on
-      ? `📢 Item and hint notifications for this tracker are now posted in **#${interaction.channel.name}**, pinging each person, instead of being DMed. Everyone still picks what they get in **DM Notifications**.`
+      ? `📢 Item and hint notifications for this tracker are now posted in <#${interaction.channelId}>, pinging each person, instead of being DMed. People who can't see this channel still get DMs. Everyone still picks what they get in **DM Notifications**.`
       : "📩 Item and hint notifications for this tracker are sent as DMs again.",
     flags: MessageFlags.Ephemeral,
   });
@@ -2328,7 +2377,7 @@ async function handleHelp(interaction) {
           "- **Status**: preview the room status, then **Post to channel**. Posted status updates itself every 5 minutes.\n" +
           "- **Register / Unregister**: join or leave the channel's view (only in **Registered Only** mode).\n" +
           "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games.\n" +
-          "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode**, **Register Someone** and **Send All Item DMs in This Channel** (posts everyone's notifications here with a ping instead of DMing them).\n" +
+          "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode**, **Register Someone** and **Post Notifications in This Channel** (posts everyone's item and hint notifications here with a ping instead of DMing them).\n" +
           "Want to follow runs privately? Use `/menu` in a DM with me.",
       }
     : {
