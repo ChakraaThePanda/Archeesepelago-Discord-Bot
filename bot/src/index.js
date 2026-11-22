@@ -419,7 +419,7 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
   // CT can return a falsy title (see buildStatusPages' own `title || "Tracker Status"` fallback).
   // embed.setTitle() throws on an empty string, and that throw isn't caught per-recipient, so
   // an unguarded raw title would silently drop every remaining DM in this tick.
-  const trackerTitle = data.title || "Tracker Status";
+  const trackerTitle = (data.title || "Tracker Status").slice(0, 256); // Discord's embed title limit
 
   // O(1) position lookups instead of scanning `data.games` per entry/item, since a room can
   // have 1000+ slots, and the old .find() calls ran once per changed slot plus once per item.
@@ -602,15 +602,16 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
     }
   }
 
-  // Whether `member` can see the channel. A private thread is only visible to its members,
-  // whatever the parent channel allows, so that's checked per person (and remembered for this
-  // check, since one person can have many notifications).
+  // Whether `member` can see the channel. A private thread is only visible to its members and to
+  // people who can manage threads, whatever the parent channel allows, so that's checked per
+  // person (and remembered for this check, since one person can have many notifications).
   const canSee = new Map();
   const postsInChannel = async member => {
     if (!channel) return false;
     if (!canSee.has(member.id)) {
-      let sees = Boolean(channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel));
-      if (sees && channel.type === ChannelType.PrivateThread) {
+      const perms = channel.permissionsFor(member);
+      let sees = Boolean(perms?.has(PermissionFlagsBits.ViewChannel));
+      if (sees && channel.type === ChannelType.PrivateThread && !perms.has(PermissionFlagsBits.ManageThreads)) {
         sees = await channel.members.fetch({ member: member.id }).then(() => true, () => false);
       }
       canSee.set(member.id, sees);
@@ -736,17 +737,21 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
 
   // Up to 10 embeds per message (and under Discord's 6000-character total). Every message names
   // whose notifications it holds, but each person is only pinged the first time in a check.
-  // If the bot can't post in the channel at all (no access or missing permissions), the rest of
-  // this check goes out as DMs. Any other failure (one bad message, a Discord hiccup) only sends
-  // that one message's notifications as DMs and keeps going.
+  // See the catch below for what happens when a post fails.
   const pinged = new Set();
   let channelFailed = false;
   for (const { member, queued } of channelPosts.values()) {
     const chunks = [];
     let chunk = [], size = 0;
     for (const q of queued) {
-      const embed = q.makeEmbed(true);
-      const len   = embedLength(embed.toJSON());
+      let embed;
+      try {
+        embed = q.makeEmbed(true);
+      } catch (err) {
+        console.warn(`[${q.tag}] Skipped a notification that couldn't be built:`, err.message);
+        continue;
+      }
+      const len = embedLength(embed.toJSON());
       if (chunk.length && (chunk.length === 10 || size + len > 6000)) {
         chunks.push(chunk);
         chunk = []; size = 0;
@@ -770,11 +775,21 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
           noteSuccess("notify", key);
           continue;
         } catch (err) {
-          if (err.code === 50001 || err.code === 50013 || err.status === 403) {
+          // Only a clear refusal falls back to DMs. A timeout or a Discord-side error may still
+          // have posted the message, and resending as DMs would double it, so that's just logged
+          // (the same as a failed DM). 50035 means this one message was refused (e.g. a field too
+          // long); any other refusal (no access, missing permissions, a locked or archived
+          // thread) means the channel won't take posts, so the rest of this check uses DMs.
+          const refused = err.status >= 400 && err.status < 500;
+          if (!refused) {
+            console.warn(`[notify] Posting in channel for ${key} may have failed:`, err.message);
+            continue;
+          }
+          if (err.code === 50035) {
+            console.warn(`[notify] Discord refused a notification post for ${key}, sending it as DMs instead:`, err.message);
+          } else {
             channelFailed = true;
             noteFailure("notify", key, err);
-          } else {
-            console.warn(`[notify] Couldn't post a notification in channel for ${key}, sending it as DMs instead:`, err.message);
           }
         }
       }
@@ -1980,7 +1995,7 @@ async function renderDmMenu(interaction, target, { kind = "progression", pages =
   if (!link) return interaction.update({ content: target.goneText, embeds: [], components: [backToStartRow(interaction)] });
 
   await interaction.deferUpdate();
-  if (loading) await interaction.editReply({ content: "Loading DM settings...", embeds: [], components: [] });
+  if (loading) await interaction.editReply({ content: "Loading notification settings...", embeds: [], components: [] });
 
   let data;
   try {
@@ -2346,7 +2361,7 @@ async function handleAdminNotifyHere(interaction, on) {
   await interaction.followUp({
     content: on
       ? `📢 Item and hint notifications for this tracker are now posted in <#${interaction.channelId}>, pinging each person, instead of being DMed. People who can't see this channel still get DMs. Everyone still picks what they get in **Notifications**.\n` +
-        "Tip: in a busy room these posts push the live status up the channel. Linking the same tracker in a separate channel or thread just for notifications keeps the status easy to find."
+        "Note: these posts go below the live status, so in a busy room the status moves up the channel."
       : "📩 Item and hint notifications for this tracker are sent as DMs again.",
     flags: MessageFlags.Ephemeral,
   });
@@ -2443,7 +2458,7 @@ async function handleHelp(interaction) {
           "Opens the bot menu for this channel.\n" +
           "- **Status**: preview the room status, then **Post to channel**. Posted status updates itself every 5 minutes.\n" +
           "- **Register / Unregister**: join or leave the channel's view (only in **Registered Only** mode).\n" +
-          "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games.\n" +
+          "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games. If an admin turned on **Post Notifications in This Channel**, the button is called **Notifications** and you're pinged here instead.\n" +
           "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode**, **Register Someone** and **Post Notifications in This Channel** (posts everyone's item and hint notifications here with a ping instead of DMing them).\n" +
           "Want to follow runs privately? Use `/menu` in a DM with me.",
       }
