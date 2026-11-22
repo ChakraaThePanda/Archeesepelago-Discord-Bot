@@ -25,6 +25,7 @@ const {
   Partials,
   InteractionContextType,
   ApplicationIntegrationType,
+  ChannelType,
   embedLength,
 } = require("discord.js");
 const fs = require("fs");
@@ -590,27 +591,35 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
   // "<guildId>:<channelId>" there) are posted in it with a ping instead, grouped per person so a
   // release or collect is a few messages rather than one per item. Everyone else, or everyone if
   // the channel can't be reached or posted in, still gets DMs.
+  // A private thread is only visible to its members, whatever the parent channel allows.
   let channel = null;
+  let threadMemberIds = null;
   if (inChannel) {
     try {
       channel = await scope.channels.fetch(key.slice(key.indexOf(":") + 1));
+      if (channel.type === ChannelType.PrivateThread) threadMemberIds = new Set((await channel.members.fetch()).keys());
     } catch (err) {
-      console.warn(`[item-dm] Couldn't reach channel for ${key}, sending DMs instead:`, err.message);
+      channel = null;
+      console.warn(`[notify] Couldn't reach channel for ${key}, sending DMs instead:`, err.message);
     }
   }
-  const postsInChannel = member => Boolean(channel?.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel));
-  const channelPosts   = new Map(); // memberId -> { member, embeds }
-  const sendDm = async (member, embed, tag) => {
+  const postsInChannel = member => Boolean(channel?.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel))
+    && (!threadMemberIds || threadMemberIds.has(member.id));
+
+  // Notifications are queued as makeEmbed(inChannel) so the wording can match where each one
+  // actually ends up, including a channel post that falls back to a DM.
+  const channelPosts = new Map(); // memberId -> { member, queued: [{ makeEmbed, tag }] }
+  const sendDm = async (member, makeEmbed, tag) => {
     try {
-      await member.send({ embeds: [embed] });
+      await member.send({ embeds: [makeEmbed(false)] });
     } catch (err) {
       console.warn(`[${tag}] Failed to DM ${member.id}:`, err.message);
     }
   };
-  const deliver = (member, embed, tag) => {
-    if (!postsInChannel(member)) return sendDm(member, embed, tag);
-    if (!channelPosts.has(member.id)) channelPosts.set(member.id, { member, embeds: [] });
-    channelPosts.get(member.id).embeds.push({ embed, tag });
+  const deliver = (member, makeEmbed, tag) => {
+    if (!postsInChannel(member)) return sendDm(member, makeEmbed, tag);
+    if (!channelPosts.has(member.id)) channelPosts.set(member.id, { member, queued: [] });
+    channelPosts.get(member.id).queued.push({ makeEmbed, tag });
   };
 
   for (const p of pendingItems) {
@@ -642,7 +651,7 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
       .setDescription(`${itemName}\n${p.game.name} (${p.game.game})`)
       .addFields({ name: "Found by", value: senderLabel });
 
-    await deliver(p.member, embed, "item-dm");
+    await deliver(p.member, () => embed, "item-dm");
   }
 
   for (const p of pendingHints) {
@@ -669,62 +678,68 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
     const otherLabel = p.otherGame ? `${p.otherGame.name} (${p.otherGame.game})` : `Player ${p.otherPlayer}`;
     const yourLabel   = `${p.game.name} (${p.game.game})`;
 
-    // "Your"/"Their" reads fine in a DM, but in a shared channel it's unclear whose is whose, so
-    // a channel post names the slots instead.
-    const isPost    = postsInChannel(p.member);
-    const yourName  = isPost ? `${p.game.name}'s` : "Your";
-    const theirName = isPost ? `${p.otherGame?.name ?? `Player ${p.otherPlayer}`}'s` : "Their";
+    // "Your"/"Their" reads fine in a DM, but not in a shared channel, so a channel post just says
+    // Item and Location. Each field's second line already names the game it belongs to.
+    const makeEmbed = inChannel => {
+      const yours  = inChannel ? "" : "Your ";
+      const theirs = inChannel ? "" : "Their ";
+      const embed  = new EmbedBuilder()
+        .setColor(HINT_DM_COLOR)
+        .setAuthor({ name: "New Hint" })
+        .setTitle(p.title)
+        .setURL(trackerUrl(p.trackerId));
 
-    const embed = new EmbedBuilder()
-      .setColor(HINT_DM_COLOR)
-      .setAuthor({ name: "New Hint" })
-      .setTitle(p.title)
-      .setURL(trackerUrl(p.trackerId));
+      if (p.scenario === "item") {
+        embed.addFields(
+          { name: `${yours}Item`, value: `${itemLabel}\n${yourLabel}` },
+          { name: `${theirs}Location`, value: `${locationName}\n${otherLabel}` },
+        );
+      } else {
+        embed.addFields(
+          { name: `${yours}Location`, value: `${locationName}\n${yourLabel}` },
+          { name: `${theirs}Item`, value: `${itemLabel}\n${otherLabel}` },
+        );
+      }
+      return embed;
+    };
 
-    if (p.scenario === "item") {
-      embed.addFields(
-        { name: `${yourName} Item`, value: `${itemLabel}\n${yourLabel}` },
-        { name: `${theirName} Location`, value: `${locationName}\n${otherLabel}` },
-      );
-    } else {
-      embed.addFields(
-        { name: `${yourName} Location`, value: `${locationName}\n${yourLabel}` },
-        { name: `${theirName} Item`, value: `${itemLabel}\n${otherLabel}` },
-      );
-    }
-
-    await deliver(p.member, embed, "hint-dm");
+    await deliver(p.member, makeEmbed, "hint-dm");
   }
 
-  // One ping per person, with up to 10 embeds per message (and under Discord's 6000-character
-  // total). If posting fails once (e.g. the bot lost Send Messages), the rest of this check goes
-  // out as DMs, logged once rather than per notification.
+  // One ping per person: up to 10 embeds per message (and under Discord's 6000-character total),
+  // with the mention only on their first message. If posting fails once (e.g. the bot lost Send
+  // Messages), the rest of this check goes out as DMs, logged once rather than per notification.
   let channelFailed = false;
-  for (const { member, embeds } of channelPosts.values()) {
+  for (const { member, queued } of channelPosts.values()) {
     const chunks = [];
     let chunk = [], size = 0;
-    for (const e of embeds) {
-      const len = embedLength(e.embed.toJSON());
+    for (const q of queued) {
+      const embed = q.makeEmbed(true);
+      const len   = embedLength(embed.toJSON());
       if (chunk.length && (chunk.length === 10 || size + len > 6000)) {
         chunks.push(chunk);
         chunk = []; size = 0;
       }
-      chunk.push(e);
+      chunk.push({ ...q, embed });
       size += len;
     }
     if (chunk.length) chunks.push(chunk);
 
+    let pinged = false;
     for (const c of chunks) {
       if (!channelFailed) {
         try {
-          await channel.send({ content: `<@${member.id}>`, embeds: c.map(e => e.embed), allowedMentions: { users: [member.id] } });
+          await channel.send(pinged
+            ? { embeds: c.map(q => q.embed), allowedMentions: { parse: [] } }
+            : { content: `<@${member.id}>`, embeds: c.map(q => q.embed), allowedMentions: { users: [member.id] } });
+          pinged = true;
           continue;
         } catch (err) {
           channelFailed = true;
-          console.warn(`[item-dm] Couldn't post in channel for ${key}, sending DMs instead:`, err.message);
+          console.warn(`[notify] Couldn't post in channel for ${key}, sending DMs instead:`, err.message);
         }
       }
-      for (const e of c) await sendDm(member, e.embed, e.tag);
+      for (const q of c) await sendDm(member, q.makeEmbed, q.tag);
     }
   }
 }
@@ -2256,9 +2271,13 @@ async function handleAdminViewMode(interaction, link, mode) {
 async function handleAdminNotifyHere(interaction, on) {
   // Refuse up front rather than confirm and then quietly fall back to DMs on every notification.
   if (on) {
-    const perms = interaction.appPermissions;
-    const send  = interaction.channel?.isThread() ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages;
-    if (perms && !perms.has([PermissionFlagsBits.ViewChannel, send, PermissionFlagsBits.EmbedLinks])) {
+    // An uncached thread would otherwise be checked for Send Messages instead of Send Messages in
+    // Threads, so fetch the channel when it isn't cached. If even that fails, require both.
+    const perms   = interaction.appPermissions;
+    const channel = interaction.channel ?? await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
+    const send    = !channel ? [PermissionFlagsBits.SendMessages, PermissionFlagsBits.SendMessagesInThreads]
+      : channel.isThread() ? [PermissionFlagsBits.SendMessagesInThreads] : [PermissionFlagsBits.SendMessages];
+    if (perms && !perms.has([PermissionFlagsBits.ViewChannel, ...send, PermissionFlagsBits.EmbedLinks])) {
       return interaction.reply({
         content: "❌ I need the **View Channel**, **Send Messages** and **Embed Links** permissions in this channel to post notifications here.",
         flags: MessageFlags.Ephemeral,
