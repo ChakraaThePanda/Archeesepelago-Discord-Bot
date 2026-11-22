@@ -54,7 +54,7 @@ The bot now runs in the background, with its logo in the system tray next to the
 * **Status**: preview the room, then **Post to channel** to share it. The posted status updates itself every 5 minutes.
 * **Register / Unregister**: add or remove yourself when the channel uses **Registered Only**.
 * **DM Notifications**: choose which of your games send you a DM when you receive a **Progression** or **Useful** item, and turn hint DMs on or off.
-* **Admin Actions** (needs the Manage Channels permission): link the channel to a tracker, or to a collection room before the game is generated. You can also unlink it, switch between **Show All** and **Registered Only** (better for big rooms), or register someone else. **Post Notifications in This Channel** posts everyone's item and hint notifications in the channel, pinging each person, instead of DMing them. People who can't see the channel still get DMs. Everyone still chooses what they get in **DM Notifications**.
+* **Admin Actions** (needs the Manage Channels permission): link the channel to a tracker, or to a collection room before the game is generated. You can also unlink it, switch between **Show All** and **Registered Only** (better for big rooms), or register someone else. **Post Notifications in This Channel** posts everyone's item and hint notifications in the channel, pinging each person, instead of DMing them. People who can't see the channel still get DMs. Everyone still chooses what they get, under **Notifications** (called **DM Notifications** when this is off).
 
 **Good to know:**
 * The bot finds your games by the Discord name your slots are claimed under on CheeseTrackers: your username, display name or server nickname.
