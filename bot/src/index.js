@@ -619,7 +619,7 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
     return canSee.get(member.id);
   };
 
-  // Notifications are queued as makeEmbed(inChannel) so the wording can match where each one
+  // Notifications are queued as makeEmbed(forChannel) so the wording can match where each one
   // actually ends up, including a channel post that falls back to a DM. A hint between two people
   // who'd both get it in the channel is posted once, mentioning both (`also` keeps the second
   // person's own version, for a DM fallback).
@@ -706,14 +706,14 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
     // line names the game it belongs to.
     const itemField     = p.scenario === "item" ? yourLabel : otherLabel;
     const locationField = p.scenario === "item" ? otherLabel : yourLabel;
-    const makeEmbed = inChannel => {
+    const makeEmbed = forChannel => {
       const embed = new EmbedBuilder()
         .setColor(HINT_DM_COLOR)
         .setAuthor({ name: "New Hint" })
         .setTitle(p.title)
         .setURL(trackerUrl(p.trackerId));
 
-      if (inChannel) {
+      if (forChannel) {
         embed.addFields(
           { name: "Item", value: `${itemLabel}\n${itemField}` },
           { name: "Location", value: `${locationName}\n${locationField}` },
