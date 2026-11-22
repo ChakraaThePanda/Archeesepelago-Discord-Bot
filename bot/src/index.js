@@ -68,7 +68,9 @@ function collectionRoomUrl(roomId) {
 // entry is never mistaken for a tracker.
 //
 // Tracker link: { trackerId, linkedAt?, mode?, registeredUsers?, messageIds?, lastActivityAt?,
-//   dmSlotSettings?, itemCounts?, hintKeys? }
+//   dmSlotSettings?, itemCounts?, hintKeys?, notifyInChannel? }
+// notifyInChannel: set by an admin, posts everyone's item and hint notifications for this link in
+//   the channel itself (pinging the person) instead of DMing them. Who gets what is unchanged.
 // Collection room: { collectionRoom: { roomId, linkedAt, messageId?, lastActivityAt? } }, where a
 //   CheeseTrackers collection room gathers YAMLs before the game is generated. messageId and
 //   lastActivityAt belong to its posted status, like a tracker link's messageIds/lastActivityAt.
@@ -423,10 +425,13 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
 
   const pendingItems = [];
   const pendingHints = [];
+  let inChannel      = false;
 
   await withLinks(links => {
     const link = lookup(links);
     if (!link?.dmSlotSettings || !Object.keys(link.dmSlotSettings).length) return;
+    // Only a server channel's link can have this set, never a DM run.
+    inChannel = Boolean(link.notifyInChannel);
 
     if (!link.itemCounts) link.itemCounts = {};
     const counts = link.itemCounts;
@@ -578,6 +583,29 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
 
   // Datapackage lookups and the actual DM sends happen after the lock is released, so other
   // links.json operations never wait on Discord API calls.
+  if (!pendingItems.length && !pendingHints.length) return;
+
+  // With notifyInChannel on, notifications go to the linked channel (key is "<guildId>:<channelId>"
+  // there) with a ping instead. If the channel can't be reached or posted in, they fall back to DMs.
+  let channel = null;
+  if (inChannel) {
+    try {
+      channel = await scope.channels.fetch(key.slice(key.indexOf(":") + 1));
+    } catch (err) {
+      console.warn(`[item-dm] Couldn't reach channel for ${key}, sending DMs instead:`, err.message);
+    }
+  }
+  const deliver = async (member, embed) => {
+    if (channel) {
+      try {
+        return await channel.send({ content: `<@${member.id}>`, embeds: [embed], allowedMentions: { users: [member.id] } });
+      } catch (err) {
+        console.warn(`[item-dm] Couldn't post in channel for ${key}, sending a DM instead:`, err.message);
+      }
+    }
+    return member.send({ embeds: [embed] });
+  };
+
   for (const p of pendingItems) {
     // Item and location names live in different datapackages (receiving vs. sending game), so fire
     // both fetches together rather than sequentially since neither depends on the other.
@@ -608,9 +636,9 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
       .addFields({ name: "Found by", value: senderLabel });
 
     try {
-      await p.member.send({ embeds: [embed] });
+      await deliver(p.member, embed);
     } catch (err) {
-      console.warn(`[item-dm] Failed to DM ${p.member.id}:`, err.message);
+      console.warn(`[item-dm] Failed to notify ${p.member.id}:`, err.message);
     }
   }
 
@@ -657,9 +685,9 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
     }
 
     try {
-      await p.member.send({ embeds: [embed] });
+      await deliver(p.member, embed);
     } catch (err) {
-      console.warn(`[hint-dm] Failed to DM ${p.member.id}:`, err.message);
+      console.warn(`[hint-dm] Failed to notify ${p.member.id}:`, err.message);
     }
   }
 }
@@ -947,7 +975,11 @@ function buildMenuEmbed(link, userId, isManager, ownedPositions = null, collecti
   const isRegisteredMode = (link.mode ?? "all") === "registered";
   const modeLabel = isRegisteredMode ? "**Registered Only**" : "**Show All**";
 
-  const lines = [`**[Tracker Room](${trackerUrl(link.trackerId)})**`, `View Mode: ${modeLabel}`];
+  const lines = [
+    `**[Tracker Room](${trackerUrl(link.trackerId)})**`,
+    `View Mode: ${modeLabel}`,
+    `Notifications: ${link.notifyInChannel ? "📢 **Posted in this channel**" : "📩 **Sent as DMs**"}`,
+  ];
   if (isRegisteredMode) {
     const isRegistered = (link.registeredUsers ?? []).includes(userId);
     lines.push(isRegistered ? "You Are: ✅ **Registered**" : "You Are: ❌ **Not Registered**");
@@ -1146,6 +1178,11 @@ function buildAdminMenuRows(link, collectionRoomId = null) {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("menu:admin:viewmode:all").setLabel("View Mode: Show All").setStyle(ButtonStyle.Primary).setDisabled(!link || (link.mode ?? "all") === "all"),
       new ButtonBuilder().setCustomId("menu:admin:viewmode:registered").setLabel("View Mode: Registered Only").setStyle(ButtonStyle.Primary).setDisabled(!link || link.mode === "registered"),
+    ),
+    new ActionRowBuilder().addComponents(
+      link?.notifyInChannel
+        ? new ButtonBuilder().setCustomId("menu:admin:notifyhere:off").setLabel("Send Item DMs as DMs Again").setStyle(ButtonStyle.Danger)
+        : new ButtonBuilder().setCustomId("menu:admin:notifyhere:on").setLabel("Send All Item DMs in This Channel").setStyle(ButtonStyle.Success).setDisabled(!link),
     ),
   ];
   if (link?.mode === "registered") {
@@ -2066,8 +2103,11 @@ async function handleLinkModeButton(interaction, mode, trackerId) {
 
   // Overwriting the entry also drops any collection room, since the tracker takes over from it.
   const { isUpdate, freshLink } = await withLinks(links => {
-    const existed = Boolean(trackerLinkOf(links, key));
+    const prev    = trackerLinkOf(links, key);
+    const existed = Boolean(prev);
     links[key]    = { trackerId, linkedAt: Date.now(), mode };
+    // Where notifications go is a channel choice, so it survives switching trackers.
+    if (prev?.notifyInChannel) links[key].notifyInChannel = true;
     return { isUpdate: existed, freshLink: links[key] };
   });
 
@@ -2174,6 +2214,28 @@ async function handleAdminViewMode(interaction, link, mode) {
   }
 }
 
+// The "Send All Item DMs in This Channel" toggle (see notifyInChannel). Only changes where
+// notifications go; everyone keeps their own settings in DM Notifications.
+async function handleAdminNotifyHere(interaction, on) {
+  const key       = linkKey(interaction.guildId, interaction.channelId);
+  const freshLink = await withLinks(links => {
+    const l = trackerLinkOf(links, key);
+    if (!l) return null;
+    if (on) l.notifyInChannel = true;
+    else delete l.notifyInChannel;
+    return l;
+  });
+  if (!freshLink) return notLinkedUpdate(interaction);
+
+  await interaction.update({ content: null, embeds: [buildMenuEmbed(freshLink, interaction.user.id, true)], components: buildAdminMenuRows(freshLink) });
+  await interaction.followUp({
+    content: on
+      ? `📢 Item and hint notifications for this tracker are now posted in **#${interaction.channel.name}**, pinging each person, instead of being DMed. Everyone still picks what they get in **DM Notifications**.`
+      : "📩 Item and hint notifications for this tracker are sent as DMs again.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 async function handleRegisterUserSelect(interaction) {
   if (!hasManageChannels(interaction)) {
     return interaction.reply({ content: MANAGE_CHANNELS_MESSAGE, flags: MessageFlags.Ephemeral });
@@ -2233,6 +2295,8 @@ async function handleMenuButton(interaction) {
 
   if (id === "menu:admin:viewmode:all")        return handleAdminViewMode(interaction, link, "all");
   if (id === "menu:admin:viewmode:registered") return handleAdminViewMode(interaction, link, "registered");
+  if (id === "menu:admin:notifyhere:on")       return handleAdminNotifyHere(interaction, true);
+  if (id === "menu:admin:notifyhere:off")      return handleAdminNotifyHere(interaction, false);
 
   if (id === "menu:admin:registeruser") {
     const selectRow = new ActionRowBuilder().addComponents(
@@ -2264,7 +2328,7 @@ async function handleHelp(interaction) {
           "- **Status**: preview the room status, then **Post to channel**. Posted status updates itself every 5 minutes.\n" +
           "- **Register / Unregister**: join or leave the channel's view (only in **Registered Only** mode).\n" +
           "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games.\n" +
-          "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode** and **Register Someone**.\n" +
+          "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode**, **Register Someone** and **Send All Item DMs in This Channel** (posts everyone's notifications here with a ping instead of DMing them).\n" +
           "Want to follow runs privately? Use `/menu` in a DM with me.",
       }
     : {
