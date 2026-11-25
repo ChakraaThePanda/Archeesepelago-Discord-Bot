@@ -78,7 +78,7 @@ function collectionRoomUrl(roomId) {
 //   lastActivityAt belong to its posted status, like a tracker link's messageIds/lastActivityAt.
 //
 // dmSlotSettings: { [discordUserId]: { progression?: "all" | apPlayerPosition[], useful?: "all" | apPlayerPosition[],
-//   hintProgression?: boolean, hintUseful?: boolean } }
+//   hintProgression?: boolean, hintUseful?: boolean, ownFinds?: boolean } }
 // progression/useful are per-user, per-slot opt-in to Progression / Useful item DMs for this
 // channel's tracker. "all" means every slot the user owns, including ones added to the room later;
 // an array is an explicit subset of AP player positions. A kind absent from a user's entry means
@@ -86,6 +86,9 @@ function collectionRoomUrl(roomId) {
 // hintProgression/hintUseful are plain on/off toggles for Hint Received DMs, applying to every
 // game the user owns (not just the slots selected above for progression/useful item DMs) since a
 // hint can be about a game the user hasn't picked for item DMs at all.
+// ownFinds: also notify for items the user found themselves (in the same game or another of their
+// games). Off by default, since they already saw those live. On its own it sends nothing, so
+// hasAnyDmSetting doesn't count it.
 // itemCounts: { [apPlayerPosition]: lastSeenItemCount }, used to detect new items only. Shared
 // baseline for both progression and useful DMs, since it just tracks total items received (it's
 // not "progression-only" despite the field's old name).
@@ -470,7 +473,7 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
         // NetworkItem tuple is [item, location, player, flags]. Here `player` is the SENDING
         // player (the world where the check happened), not the receiver. If that slot is claimed
         // by the same Discord user (even a different one of their games), they found it
-        // themselves and already saw it live, so skip the DM.
+        // themselves and already saw it live, so skip the DM unless they turned on ownFinds.
         const [itemId, locationId, senderPlayer, flags = 0] = netItem;
 
         let kind;
@@ -479,8 +482,10 @@ async function checkNewDms(data, scope, key, lookup = links => trackerLinkOf(lin
         else continue;
 
         const senderGame = gameByPosition.get(senderPlayer);
-        const senderMember = resolveOwnerMember(memberByUsername, senderGame);
-        if (senderMember && senderMember.id === member.id) continue;
+        if (!dmSetting.ownFinds) {
+          const senderMember = resolveOwnerMember(memberByUsername, senderGame);
+          if (senderMember && senderMember.id === member.id) continue;
+        }
 
         // Location ids live in the SENDING game's namespace (the location belongs to the world
         // where the check happened), unlike item ids which live in the receiving game's namespace.
@@ -1019,7 +1024,7 @@ function buildStatusNavRow(trackerId, page, totalPages) {
 }
 
 function postButton(customId) {
-  return new ButtonBuilder().setCustomId(customId).setLabel("Post to channel").setStyle(ButtonStyle.Primary);
+  return new ButtonBuilder().setCustomId(customId).setLabel("Post to Channel").setStyle(ButtonStyle.Primary);
 }
 
 // "menu:back" returns to the main menu, "menu:admin" to Admin Actions.
@@ -1056,11 +1061,11 @@ function notLinkedUpdate(interaction) {
 // (links.json never prunes those on its own), which would overcount. Omitted at call sites that
 // don't have fresh tracker data on hand; those fall back to the raw (possibly stale) length.
 function dmSettingSummary(setting, ownedPositions = null) {
-  if (setting === "all") return "✅ **On** (all games)";
+  if (setting === "all") return "✅ **All Games**";
   if (!Array.isArray(setting) || !setting.length) return "❌ **Off**";
   const count = ownedPositions ? setting.filter(p => ownedPositions.includes(p)).length : setting.length;
   if (!count) return "❌ **Off**";
-  return `✅ **On** (${count} game${count === 1 ? "" : "s"})`;
+  return `✅ **${count} Game${count === 1 ? "" : "s"}**`;
 }
 
 // `collectionRoomId` is only passed (and only matters) while no tracker is linked.
@@ -1084,31 +1089,36 @@ function buildMenuEmbed(link, userId, isManager, ownedPositions = null, collecti
   const isRegisteredMode = (link.mode ?? "all") === "registered";
   const modeLabel = isRegisteredMode ? "**Registered Only**" : "**Show All**";
 
-  const lines = [
-    `**[Tracker Room](${trackerUrl(link.trackerId)})**`,
+  const channelLines = [
     `View Mode: ${modeLabel}`,
-    `Notifications: ${link.notifyInChannel ? "📢 **Posted in this channel**" : "📩 **Sent as DMs**"}`,
+    `Notifications: ${link.notifyInChannel ? "📢 **Posted Here**" : "📩 **Sent as DMs**"}`,
   ];
   if (isRegisteredMode) {
     const isRegistered = (link.registeredUsers ?? []).includes(userId);
-    lines.push(isRegistered ? "You Are: ✅ **Registered**" : "You Are: ❌ **Not Registered**");
+    channelLines.push(isRegistered ? "You: ✅ **Registered**" : "You: ❌ **Not Registered**");
   }
 
-  lines.push(...dmSettingLines(link.dmSlotSettings?.[userId], ownedPositions, link.notifyInChannel));
-  e.setDescription(lines.join("\n"));
-  return e;
+  return e
+    .setDescription(`**[Tracker Room](${trackerUrl(link.trackerId)})**`)
+    .addFields(
+      { name: "This Channel", value: channelLines.join("\n") },
+      dmSettingField(link.dmSlotSettings?.[userId], ownedPositions),
+    );
 }
 
-// One summary line per notification kind, for the channel menu and a DM run's menu.
-// `inChannel` drops "DMs" from the labels when the channel posts notifications instead.
-function dmSettingLines(dmSetting, ownedPositions = null, inChannel = false) {
-  const items = inChannel ? "Items" : "Item DMs";
-  return [
-    `Progression ${items}: ${dmSettingSummary(dmSetting?.progression, ownedPositions)}`,
-    `Progression Hints: ${dmSetting?.hintProgression ? "✅ **On** (all games)" : "❌ **Off**"}`,
-    `Useful ${items}: ${dmSettingSummary(dmSetting?.useful, ownedPositions)}`,
-    `Useful Hints: ${dmSetting?.hintUseful ? "✅ **On** (all games)" : "❌ **Off**"}`,
-  ];
+// The user's notification settings as one embed field, for the channel menu and a DM run's menu:
+// one line per kind (its items and hints together), then whether items they found count.
+function dmSettingField(dmSetting, ownedPositions = null) {
+  const onOff = on => (on ? "✅ **On**" : "❌ **Off**");
+  return {
+    name: "Your Notifications",
+    value: [
+      ...DM_KINDS.map(k =>
+        `${DM_KIND_LABELS[k]}: Items ${dmSettingSummary(dmSetting?.[k], ownedPositions)} · Hints ${onOff(dmSetting?.[HINT_FLAG_KEY[k]])}`
+      ),
+      `Items You Find Yourself: ${dmSetting?.ownFinds ? "✅ **Included**" : "❌ **Skipped**"}`,
+    ].join("\n"),
+  };
 }
 
 // One row instead of one-button-per-row. Discord allows up to 5 buttons per action row, and
@@ -1170,15 +1180,22 @@ function decodeDmPages(parts) {
   return pages;
 }
 
-function buildDmTabRow(activeKind, pages, prefix = "menu") {
+// The tabs, then the ownFinds toggle. It sits here rather than with a tab's controls since it
+// covers both kinds.
+function buildDmTabRow(activeKind, pages, dmSetting, prefix = "menu") {
   const encoded = encodeDmPages(pages);
+  const ownOn   = Boolean(dmSetting.ownFinds);
   return new ActionRowBuilder().addComponents(
     ...DM_KINDS.map(k =>
       new ButtonBuilder()
         .setCustomId(`${prefix}:dmtab:${k}:${encoded}`)
         .setLabel(DM_KIND_LABELS[k])
         .setStyle(k === activeKind ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    )
+    ),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:dmown:${activeKind}:${ownOn ? "off" : "on"}:${encoded}`)
+      .setLabel(ownOn ? "Skip Items I Find Myself" : "Include Items I Find Myself")
+      .setStyle(ownOn ? ButtonStyle.Danger : ButtonStyle.Success)
   );
 }
 
@@ -1270,7 +1287,7 @@ function buildDmMenuRows(link, userId, ownedGames, activeKind = "progression", p
 
   const settings = link.dmSlotSettings?.[userId] ?? {};
   return [
-    buildDmTabRow(activeKind, pages, prefix),
+    buildDmTabRow(activeKind, pages, settings, prefix),
     ...buildDmSlotRows(activeKind, ownedGames, settings, pages, prefix),
     backToMenuRow(backId),
   ];
@@ -1308,7 +1325,7 @@ function buildAdminMenuRows(link, collectionRoomId = null) {
 function buildUnlinkConfirmRows() {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("menu:admin:unlink:confirm").setLabel("Yes, unlink").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("menu:admin:unlink:confirm").setLabel("Yes, Unlink").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("menu:admin:unlink:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary),
     ),
   ];
@@ -2045,6 +2062,8 @@ async function renderDmMenu(interaction, target, { kind = "progression", pages =
 //   the user owns, unlike the per-game pickers, since hints affect other players and shouldn't be
 //   silently scoped to a subset of games.
 // - dmslotpage:<kind>:<p|n>:<pages...>, pages the select.
+// - dmown:<kind>:<on|off>:<pages...>, the ownFinds toggle (covers both kinds; `kind` is just the
+//   tab to stay on).
 function handleDmControl(interaction, target, action, [kind, ...rest]) {
   if (action === "dmtab") return renderDmMenu(interaction, target, { kind, pages: decodeDmPages(rest) });
 
@@ -2072,13 +2091,16 @@ function handleDmControl(interaction, target, action, [kind, ...rest]) {
   if (action === "dmhint") {
     return renderDmMenu(interaction, target, { kind, pages, change: settings => { settings[HINT_FLAG_KEY[kind]] = arg === "on"; } });
   }
+  if (action === "dmown") {
+    return renderDmMenu(interaction, target, { kind, pages, change: settings => { settings.ownFinds = arg === "on"; } });
+  }
   if (action === "dmslotpage") {
     pages[kind] += arg === "n" ? 1 : -1;
     return renderDmMenu(interaction, target, { kind, pages });
   }
 }
 
-const DM_CONTROL_ACTIONS = new Set(["dmtab", "dmslot", "dmslotall", "dmhint", "dmslotpage"]);
+const DM_CONTROL_ACTIONS = new Set(["dmtab", "dmslot", "dmslotall", "dmhint", "dmslotpage", "dmown"]);
 
 // A channel menu's notification control: menu:<action>:...
 function handleChannelDmControl(interaction) {
@@ -2456,7 +2478,7 @@ async function handleHelp(interaction) {
         name: "`/menu`",
         value:
           "Opens the bot menu for this channel.\n" +
-          "- **Status**: preview the room status, then **Post to channel**. Posted status updates itself every 5 minutes.\n" +
+          "- **Status**: preview the room status, then **Post to Channel**. Posted status updates itself every 5 minutes.\n" +
           "- **Register / Unregister**: join or leave the channel's view (only in **Registered Only** mode).\n" +
           "- **DM Notifications**: get a DM when you receive a **Progression** or **Useful** item, per game. Each tab also has a **Hints** toggle for hints involving your games. If an admin turned on **Post Notifications in This Channel**, the button is called **Notifications** and you're pinged here instead.\n" +
           "- **Admin Actions** *(Manage Channels)*: link a tracker, or a collection room until the tracker exists. Also **Unlink Channel**, **View Mode**, **Register Someone** and **Post Notifications in This Channel** (posts everyone's item and hint notifications here with a ping instead of DMing them).\n" +
@@ -2540,12 +2562,16 @@ function buildDmHomeView(userId, content = null) {
 // `ownedPositions` is only known once the tracker was fetched (the notification menu). Then a run
 // where none of the user's slots match their Discord name says so, since nothing would notify.
 function buildDmRunEmbed(run, user, ownedPositions = null) {
-  const lines = [`**[Tracker Room](${trackerUrl(run.trackerId)})**`, ...dmSettingLines(run.dmSlotSettings?.[user.id], ownedPositions)];
+  const lines = [`**[Tracker Room](${trackerUrl(run.trackerId)})**`];
   if (ownedPositions && !ownedPositions.length) {
     const names = [user.username, user.globalName].filter(Boolean).map(n => `**${n}**`).join(" or ");
     lines.push("", `No game in this run is claimed under your Discord name (${names}). Claim your slots on CheeseTrackers with that name to get notifications.`);
   }
-  return new EmbedBuilder().setColor(EMBED_COLOR).setTitle(dmRunTitle(run).slice(0, 256)).setDescription(lines.join("\n"));
+  return new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setTitle(dmRunTitle(run).slice(0, 256))
+    .setDescription(lines.join("\n"))
+    .addFields(dmSettingField(run.dmSlotSettings?.[user.id], ownedPositions));
 }
 
 function buildDmRunView(run, user, content = null) {
@@ -2773,7 +2799,7 @@ async function handleDmRunInteraction(interaction) {
       content: `Remove **${dmRunTitle(run)}** from your runs? Its DM notifications stop too.`,
       embeds: [],
       components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`dm:r:${trackerId}:removeyes`).setLabel("Yes, remove").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`dm:r:${trackerId}:removeyes`).setLabel("Yes, Remove").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`dm:r:${trackerId}:run`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
       )],
     });
